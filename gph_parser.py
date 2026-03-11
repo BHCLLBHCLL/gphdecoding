@@ -132,7 +132,7 @@ def parse_gph(filepath: str) -> dict:
         (0x0600, 0x0628, "OverlapStart_0", "overlap marker"),
         (0x0628, 0x08dc, "LS_CvolIdOfElements", "I4[135] control volume IDs"),
         (0x08dc, 0x26b0, "LS_Links", "I4[] link/connectivity pairs"),
-        (0x26b0, 0x2c60, "LS_Nodes", "R4[364] or R4[n*3] vertex coords"),
+        (0x26b0, 0x2c60, "LS_Nodes", "R8[n,3] vertex coords (word-reversed float64, 3 axis blocks)"),
         (0x2c60, 0x42b0, "LS_SurfaceRegions", "surface region data"),
         (0x42b0, 0x45a4, "Element_InformationFlag", "element flags"),
         (0x45a4, len(data), "OverlapEnd", "trailer"),
@@ -150,25 +150,75 @@ def parse_gph(filepath: str) -> dict:
         )
 
     # --- Data array extraction for validation ---
-    # LS_CvolIdOfElements: 135 x I4
-    cv_start = 0x069C  # approximate
-    n_cv = 135
-    if cv_start + n_cv * 4 <= len(data):
-        arr = [read_i32_be(data, cv_start + i * 4) for i in range(min(n_cv, 10))]
-        result["data_arrays"]["LS_CvolIdOfElements_sample"] = arr
+    # LS_CvolIdOfElements: n x I4, located dynamically
+    # Structure: 40B label-header + 5×16B descriptors + 12B data-header + n×4B data
+    cv_sec = b"LS_CvolIdOfElements" + b" " * 13  # 32 chars total
+    cv_idx = data.find(cv_sec)
+    if cv_idx >= 4 and read_i32_be(data, cv_idx - 4) == 32:
+        cv_pos = cv_idx - 4 + 40  # skip section header
+        # Skip 5 descriptors (each 16B) to find the one with dim0 = n_elements
+        n_cv = 0
+        for _ in range(10):
+            if cv_pos + 16 > len(data) or read_i32_be(data, cv_pos) != 12:
+                break
+            d0 = read_i32_be(data, cv_pos + 8)
+            d1 = read_i32_be(data, cv_pos + 12)
+            cv_pos += 16
+            if d1 == 1 and d0 > 1:
+                n_cv = d0
+                break
+        if n_cv > 0:
+            cv_pos += 12  # skip 12B data header
+            arr = [read_i32_be(data, cv_pos + i * 4) for i in range(min(n_cv, 10))]
+            result["data_arrays"]["LS_CvolIdOfElements_sample"] = arr
+            result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
 
-    # LS_Nodes: vertex coordinates (R4 x 3 per vertex)
-    nodes_start = 0x2740  # approximate, after descriptors
-    n_nodes = (0x2C60 - nodes_start) // (3 * 4)  # R4 xyz
-    if n_nodes > 0 and nodes_start + n_nodes * 12 <= len(data):
-        sample = []
-        for i in range(min(3, n_nodes)):
-            x = read_f32_be(data, nodes_start + i * 12)
-            y = read_f32_be(data, nodes_start + i * 12 + 4)
-            z = read_f32_be(data, nodes_start + i * 12 + 8)
-            sample.append((x, y, z))
-        result["data_arrays"]["LS_Nodes_sample"] = sample
-        result["data_arrays"]["LS_Nodes_count"] = n_nodes
+    # LS_Nodes: vertex coordinates stored as three separate float64 axis blocks
+    # Each block: [16B descriptor: 12/8/n/1] + [12B header: 12/bytes/upper_max]
+    #             + [n × 8B word-reversed float64]
+    # Word-reversed means each float64 is stored as [lower_32bit_BE][upper_32bit_BE].
+    # e.g. 0.01 = 0x3F847AE147AE147B is stored as bytes 47 AE 14 7B 3F 84 7A E1.
+    nodes_label = b"LS_Nodes" + b" " * 24
+    nodes_idx = data.find(nodes_label)
+    if nodes_idx >= 4:
+        pos = nodes_idx + 32 + 4 + 4  # skip name(32) + second marker(4) + first desc(4 already counted)
+        # Actually skip past label header: 4(marker)+32(name)+4(marker) = 40B from section start
+        pos = nodes_idx - 4 + 40  # section_start + 40
+        # Scan to find first [12, 8, n, 1] descriptor
+        n_nodes = 0
+        while pos + 16 <= len(data):
+            if int.from_bytes(data[pos:pos+4], "big") != 12:
+                break
+            tc = int.from_bytes(data[pos+4:pos+8], "big")
+            d0 = int.from_bytes(data[pos+8:pos+12], "big")
+            d1 = int.from_bytes(data[pos+12:pos+16], "big")
+            pos += 16
+            if tc == 8 and d1 == 1 and d0 > 0:
+                n_nodes = d0
+                break
+        if n_nodes > 0:
+            sample = []
+            axis_vals = []
+            for axis in range(min(3, 3)):
+                if pos + 12 > len(data):
+                    break
+                pos += 12  # skip 12B header
+                vals = []
+                for i in range(n_nodes):
+                    if pos + 8 > len(data):
+                        break
+                    lower = int.from_bytes(data[pos:pos+4], "big")
+                    upper = int.from_bytes(data[pos+4:pos+8], "big")
+                    vals.append(struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, "big"))[0])
+                    pos += 8
+                axis_vals.append(vals)
+                if pos + 16 <= len(data) and int.from_bytes(data[pos:pos+4], "big") == 12:
+                    pos += 16
+            if len(axis_vals) == 3:
+                for i in range(min(3, n_nodes)):
+                    sample.append((axis_vals[0][i], axis_vals[2][i], axis_vals[1][i]))
+                result["data_arrays"]["LS_Nodes_sample"] = sample
+                result["data_arrays"]["LS_Nodes_count"] = n_nodes
 
     return result
 
@@ -241,11 +291,24 @@ def format_description() -> str:
 5. DATA ARRAYS
 --------------
 
-  LS_CvolIdOfElements  : I4[135]  - control volume ID per element
-  LS_Links             : I4[]     - connectivity (pairs or hex indices)
-  LS_Nodes             : R4[n,3]  - vertex XYZ coordinates (big-endian float32)
-  LS_SurfaceRegions    : variable - surface region definitions
+  LS_CvolIdOfElements  : I4[n]    - control volume ID per element (n from descriptor)
+  LS_Links             : I4[]     - element connectivity (raw big-endian int32)
+  LS_Nodes             : R8[n,3]  - vertex XYZ as three word-reversed float64 blocks
+  LS_SurfaceRegions    : variable - surface boundary region definitions
   Element_InformationFlag : flags per element
+
+  LS_Nodes detail:
+    Each spatial axis (X, Z, Y in file order) is stored as one block:
+      [16B descriptor: I4=12 / I4=8 / I4=n_verts / I4=1]
+      [12B header:     I4=12 / I4=byte_count / I4=upper_half_of_max_coord]
+      [n_verts × 8B]  one word-reversed float64 per vertex
+
+    Word-reversed float64: each 8-byte double is stored as
+      [lower_32bit_word_BE][upper_32bit_word_BE]
+    Example: 0.01 (= 0x3F847AE147AE147B) is stored as bytes
+      47 AE 14 7B  3F 84 7A E1
+    When mis-read as two float32 values this yields (89128.96, 1.035),
+    which is the root cause of the "89000+" coordinate bug.
 
 6. ALIGNMENT & PADDING
 ----------------------
