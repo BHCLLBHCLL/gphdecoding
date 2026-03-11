@@ -28,6 +28,147 @@ def read_f32_be(data: bytes, pos: int) -> float:
     return struct.unpack(">f", data[pos : pos + 4])[0]
 
 
+def read_f64_wr(data: bytes, pos: int) -> float:
+    """Read float64 stored in word-reversed (middle-endian) format.
+
+    The GPH format stores 64-bit doubles as two 32-bit big-endian words in
+    reversed order: [lower_32bit_word][upper_32bit_word].  A coordinate of
+    0.01 is therefore stored as bytes 47 AE 14 7B 3F 84 7A E1, which when
+    mis-read as two consecutive float32 values yields (89128.96, 1.035) –
+    the exact "89000+" symptom reported during testing.
+    """
+    lower = int.from_bytes(data[pos : pos + 4], "big")
+    upper = int.from_bytes(data[pos + 4 : pos + 8], "big")
+    combined = ((upper << 32) | lower).to_bytes(8, "big")
+    return struct.unpack(">d", combined)[0]
+
+
+def _find_section(data: bytes, name: str) -> int:
+    """Return offset of the I4=32 marker that precedes *name* (padded to 32 chars).
+
+    Returns -1 if not found.
+    """
+    name_padded = name.ljust(32).encode("ascii")
+    idx = data.find(name_padded)
+    if idx < 4:
+        return -1
+    if read_i32_be(data, idx - 4) == 32:
+        return idx - 4
+    return -1
+
+
+def _parse_ls_nodes(data: bytes) -> tuple:
+    """Parse the LS_Nodes section and return (xyz_array, n_vertices).
+
+    The section stores three coordinate axes (X, Z, Y in file order) each as
+    a separate block:
+        [16-byte descriptor: 12 / 8 / n_verts / 1]
+        [12-byte header:     12 / byte_count / upper_half_of_max_coord]
+        [n_verts × 8-byte word-reversed float64 values]
+
+    Returns (xyz, n_vertices) where xyz has shape (n_vertices, 3) with
+    columns CoordinateX, CoordinateY, CoordinateZ, or (None, 0) on failure.
+    """
+    sec_start = _find_section(data, "LS_Nodes")
+    if sec_start < 0:
+        return None, 0
+
+    # Skip: I4=32 (4B) + name (32B) + I4=32 (4B) = 40B
+    pos = sec_start + 40
+
+    # Scan descriptor blocks [12, type, dim0, dim1] until we find the first
+    # coordinate-block descriptor [12, 8, n_verts, 1].
+    n_vertices = 0
+    while pos + 16 <= len(data):
+        if read_i32_be(data, pos) != 12:
+            break
+        type_code = read_i32_be(data, pos + 4)
+        dim0 = read_i32_be(data, pos + 8)
+        dim1 = read_i32_be(data, pos + 12)
+        pos += 16
+        if type_code == 8 and dim1 == 1 and dim0 > 0:
+            n_vertices = dim0
+            break
+
+    if n_vertices == 0:
+        return None, 0
+
+    # Read three successive coordinate blocks (X, Z, Y order in the file).
+    # Each block: [12B header] [n_vertices × 8B word-reversed float64].
+    # Between blocks there is a 16-byte descriptor; skip it when present.
+    coord_blocks: list[list[float]] = []
+    for _ in range(3):
+        if pos + 12 > len(data):
+            break
+        # 12-byte header: [I4=12][I4=byte_count][I4=upper_half_of_max]
+        pos += 12
+        vals: list[float] = []
+        for _ in range(n_vertices):
+            if pos + 8 > len(data):
+                break
+            vals.append(read_f64_wr(data, pos))
+            pos += 8
+        coord_blocks.append(vals)
+        # Skip the next 16-byte descriptor if present
+        if pos + 16 <= len(data) and read_i32_be(data, pos) == 12:
+            pos += 16
+
+    if len(coord_blocks) < 3:
+        return None, 0
+
+    # File order is X, Z, Y → rearrange to X, Y, Z for CGNS output
+    x_vals, z_vals, y_vals = coord_blocks
+    xyz = np.array(
+        [[x_vals[i], y_vals[i], z_vals[i]] for i in range(n_vertices)],
+        dtype=np.float64,
+    )
+    return xyz, n_vertices
+
+
+def _parse_ls_links(data: bytes) -> tuple:
+    """Return (links_raw, n_ints) for the LS_Links section.
+
+    Locates the section dynamically and returns the raw big-endian int32
+    array that starts after the section label header (40 bytes) and the
+    five 16-byte descriptor blocks (80 bytes).
+    """
+    sec_start = _find_section(data, "LS_Links")
+    if sec_start < 0:
+        return None, 0
+
+    next_sec = _find_section(data, "LS_Nodes")
+    if next_sec < 0 or next_sec <= sec_start:
+        return None, 0
+
+    # Skip section header (40B) + 5 descriptor blocks (80B)
+    data_start = sec_start + 40 + 80
+    data_end = next_sec
+    n_ints = (data_end - data_start) // 4
+    if n_ints <= 0 or data_start + n_ints * 4 > len(data):
+        return None, 0
+
+    links_raw = np.frombuffer(data[data_start : data_start + n_ints * 4], dtype=">i4")
+    return links_raw, n_ints
+
+
+def _parse_n_elements(data: bytes) -> int:
+    """Return the element count from LS_CvolIdOfElements (dim0 of descriptor 5)."""
+    sec_start = _find_section(data, "LS_CvolIdOfElements")
+    if sec_start < 0:
+        return 135  # fallback
+
+    pos = sec_start + 40
+    for _ in range(10):
+        if pos + 16 > len(data) or read_i32_be(data, pos) != 12:
+            break
+        dim0 = read_i32_be(data, pos + 8)
+        dim1 = read_i32_be(data, pos + 12)
+        pos += 16
+        if dim1 == 1 and dim0 > 1:
+            return dim0
+    return 135
+
+
 def _parse_element_connectivity(links: np.ndarray, n_vertices: int, n_elements: int):
     """Try to extract element connectivity from LS_Links raw data.
     Returns (element_nodes_list, element_type) or (None, None) on failure.
@@ -91,32 +232,20 @@ def parse_gph_mesh(filepath: str) -> dict:
 
     result = {"vertices": None, "elements": None, "element_type": None, "n_vertices": 0, "n_elements": 0}
 
-    # LS_Nodes
-    nodes_section_end = 0x2C60
-    nodes_data_start = 0x2750
-    n_vertices = (nodes_section_end - nodes_data_start) // 12
-    if nodes_data_start + n_vertices * 12 <= len(data):
-        xyz = np.zeros((n_vertices, 3), dtype=np.float32)
-        for i in range(n_vertices):
-            base = nodes_data_start + i * 12
-            xyz[i, 0] = read_f32_be(data, base)
-            xyz[i, 1] = read_f32_be(data, base + 4)
-            xyz[i, 2] = read_f32_be(data, base + 8)
+    # LS_Nodes – coordinates stored as word-reversed float64 in three axis blocks
+    xyz, n_vertices = _parse_ls_nodes(data)
+    if xyz is not None and n_vertices > 0:
         result["vertices"] = xyz
         result["n_vertices"] = n_vertices
 
-    # LS_Links
-    links_start = 0x09C0
-    links_end = 0x26B0
-    n_ints = (links_end - links_start) // 4
-    links_raw = None
-    if n_ints > 0 and links_start + n_ints * 4 <= len(data):
-        links_raw = np.frombuffer(data[links_start : links_start + n_ints * 4], dtype=">i4")
+    # LS_Links – raw int32 connectivity data
+    links_raw, n_ints = _parse_ls_links(data)
+    if links_raw is not None:
         result["links_raw"] = links_raw
         result["n_links_ints"] = n_ints
 
-    # Element count
-    n_elements = 135
+    # Element count from LS_CvolIdOfElements
+    n_elements = _parse_n_elements(data)
     result["n_elements"] = n_elements
 
     # Parse connectivity
@@ -221,9 +350,10 @@ def write_cgns(mesh: dict, outpath: str, zone_name: str = "Zone1") -> None:
         raise ValueError("No vertices to write")
 
     n_vertex = vertices.shape[0]
-    x = vertices[:, 0].astype(np.float64)
-    y = vertices[:, 1].astype(np.float64)
-    z = vertices[:, 2].astype(np.float64)
+    # xyz is already float64 from the word-reversed float64 parser
+    x = np.asarray(vertices[:, 0], dtype=np.float64)
+    y = np.asarray(vertices[:, 1], dtype=np.float64)
+    z = np.asarray(vertices[:, 2], dtype=np.float64)
 
     n_cell = mesh.get("n_elements", 0) if mesh.get("links_raw") is not None else 0
     n_cell = max(1, n_cell)

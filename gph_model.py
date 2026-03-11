@@ -16,6 +16,14 @@ def read_f32_be(data: bytes, pos: int) -> float:
     return struct.unpack(">f", data[pos : pos + 4])[0]
 
 
+def read_f64_wr(data: bytes, pos: int) -> float:
+    """Read float64 stored as word-reversed: [lower_32bit_BE][upper_32bit_BE]."""
+    lower = int.from_bytes(data[pos : pos + 4], "big")
+    upper = int.from_bytes(data[pos + 4 : pos + 8], "big")
+    combined = ((upper << 32) | lower).to_bytes(8, "big")
+    return struct.unpack(">d", combined)[0]
+
+
 @dataclass
 class GphNode:
     """A node in the GPH tree - can represent a section or a data item."""
@@ -85,7 +93,7 @@ class GphDocument:
             (0x0600, 0x0628, "OverlapStart_0", "marker"),
             (0x0628, 0x08DC, "LS_CvolIdOfElements", "I4[135]"),
             (0x08DC, 0x26B0, "LS_Links", "I4[]"),
-            (0x26B0, 0x2C60, "LS_Nodes", "R4[n,3]"),
+            (0x26B0, 0x2C60, "LS_Nodes", "R8[n,3]"),
             (0x2C60, 0x42B0, "LS_SurfaceRegions", "raw"),
             (0x42B0, 0x45A4, "Element_InformationFlag", "raw"),
             (0x45A4, len(data), "OverlapEnd", "trailer"),
@@ -134,24 +142,47 @@ class GphDocument:
             return GphNode(name, offset, len(raw), "I4[]", value=None, raw=raw, children=[])
 
         if name == "LS_Nodes":
-            # Vertices at ~0x2750 from file start
-            data_start = 0x2750 - offset
-            if data_start >= 0:
-                n = (len(raw) - data_start) // 12
-                verts = []
-                for i in range(min(n, 200)):
-                    base = data_start + i * 12
-                    if base + 12 <= len(raw):
-                        x = read_f32_be(raw, base)
-                        y = read_f32_be(raw, base + 4)
-                        z = read_f32_be(raw, base + 8)
-                        verts.append((x, y, z))
-                if verts:
+            # Coordinates stored as three word-reversed float64 axis blocks.
+            # Each block: [16B descriptor: 12/8/n/1] + [12B header] + [n×8B data].
+            # Scan for the first [12, 8, n, 1] descriptor to locate n_vertices.
+            pos = 40  # skip 40B label-header
+            n_vertices = 0
+            while pos + 16 <= len(raw):
+                if read_i32_be(raw, pos) != 12:
+                    break
+                tc = read_i32_be(raw, pos + 4)
+                d0 = read_i32_be(raw, pos + 8)
+                d1 = read_i32_be(raw, pos + 12)
+                pos += 16
+                if tc == 8 and d1 == 1 and d0 > 0:
+                    n_vertices = d0
+                    break
+            if n_vertices > 0:
+                axis_vals: list[list[float]] = []
+                for _ in range(3):
+                    if pos + 12 > len(raw):
+                        break
+                    pos += 12  # skip 12B data header
+                    vals: list[float] = []
+                    for _ in range(n_vertices):
+                        if pos + 8 > len(raw):
+                            break
+                        vals.append(read_f64_wr(raw, pos))
+                        pos += 8
+                    axis_vals.append(vals)
+                    if pos + 16 <= len(raw) and read_i32_be(raw, pos) == 12:
+                        pos += 16
+                if len(axis_vals) == 3:
+                    # file order: X, Z, Y → rearrange to X, Y, Z
+                    verts = [
+                        (axis_vals[0][i], axis_vals[2][i], axis_vals[1][i])
+                        for i in range(n_vertices)
+                    ]
                     return GphNode(
-                        name, offset, len(raw), "R4[n,3]",
+                        name, offset, len(raw), "R8[n,3]",
                         value=verts, raw=raw, children=[],
                     )
-            return GphNode(name, offset, len(raw), "R4[]", value=None, raw=raw, children=[])
+            return GphNode(name, offset, len(raw), "R8[]", value=None, raw=raw, children=[])
 
         if name == "LS_Links":
             data_start = 0x09C0 - offset
