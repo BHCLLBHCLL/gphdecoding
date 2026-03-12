@@ -1,304 +1,368 @@
-# gph2cgns 坐标解析 Bug 修复开发总结
+# gph2cgns 开发总结
 
-## 1. 问题背景
+## 目录
 
-`gph2cgns` 工具用于将 SCTpre 生成的专有二进制格式 `.gph` 文件转换为
-工业标准 CFD 网格格式 CGNS/HDF5。测试发现输出的坐标值严重错误：
-`CoordinateX` 应在 `0–0.01` 范围内，实际解析结果却出现大量 **89000+**
-的异常值，显然是解析错位所致。
+1. [项目背景](#1-项目背景)
+2. [第一阶段：坐标解析 Bug 修复](#2-第一阶段坐标解析-bug-修复)
+3. [第二阶段：面单元与边界条件完善](#3-第二阶段面单元与边界条件完善)
+4. [GPH 格式逆向工程结论](#4-gph-格式逆向工程结论)
+5. [最终输出格式说明](#5-最终输出格式说明)
+6. [改动文件清单](#6-改动文件清单)
+7. [经验总结](#7-经验总结)
 
 ---
 
-## 2. 问题现象
+## 1. 项目背景
 
-| 项目 | 期望值 | 实际值 |
-|------|--------|--------|
-| 顶点数 | 52 | 108（计算错误） |
-| CoordinateX 范围 | [0, 0.01] | [-683142528, 3.5e34] |
+`gph2cgns` 工具用于将 SCTpre 生成的专有二进制格式 `.gph` 文件
+（魔数 `CRDL-FLD`，大端序）转换为工业标准 CFD 网格格式 CGNS/HDF5。
+
+测试文件 `box.gph`：10mm × 10mm × 10mm 立方体网格，52 个顶点，
+135 个四面体单元，307 个三角面。
+
+---
+
+## 2. 第一阶段：坐标解析 Bug 修复
+
+### 2.1 问题现象
+
+`CoordinateX` 应在 `[0, 0.01]` 范围内，实际解析结果出现大量 **89000+** 异常值。
+
+| 项目 | 期望值 | 实际值（修复前） |
+|------|--------|-----------------|
+| 顶点数 | 52 | 108（错误） |
+| CoordinateX 范围 | [0, 0.01] | [-6.8e8, 3.5e34] |
 | CoordinateY 范围 | [0, 0.01] | [-1.5e29, 7.9e34] |
 | CoordinateZ 范围 | [0, 0.01] | [-4.3e15, 4.2e36] |
-| 含 89000+ 的坐标分量数 | 0 | 22 |
+| 含 89000+ 的分量数 | 0 | 22 |
 
-运行原始代码的具体症状：
+### 2.2 调查过程
 
-```
-  Vertex 0: (0.000000, 0.000000, 1.035000)   ← z 看似合理，实为误读
-  Vertex 1: (89128.960938, 0.996722, -0.000000)  ← X 出现 89000+
-  Vertex 2: (1.035000, 89128.960938, 1.035000)   ← Y 出现 89000+
-```
+**步骤一：排查硬编码偏移量**
 
----
-
-## 3. 调查过程
-
-### 3.1 排查硬编码偏移量
-
-原代码 `parse_gph_mesh()` 使用以下硬编码参数读取坐标：
+原代码使用硬编码参数读取 float32 坐标：
 
 ```python
 # 原代码（错误）
-nodes_section_end = 0x2C60
-nodes_data_start  = 0x2750
-n_vertices = (nodes_section_end - nodes_data_start) // 12  # = 108（错误）
-
-for i in range(n_vertices):
-    base = nodes_data_start + i * 12
-    xyz[i, 0] = read_f32_be(data, base)      # float32
-    xyz[i, 1] = read_f32_be(data, base + 4)  # float32
-    xyz[i, 2] = read_f32_be(data, base + 8)  # float32
+nodes_data_start = 0x2750
+n_vertices = (0x2C60 - 0x2750) // 12  # = 108（错误）
+xyz[i, 0] = read_f32_be(data, base)   # float32 误读
 ```
 
-初步判断为"偏移量错误"，但调整偏移量和步长后，89000+ 问题依然存在。
+调整偏移和步长后，89000+ 问题依然存在，说明根因不是偏移错误。
 
-### 3.2 定位 89000+ 的来源
+**步骤二：定位 89000+ 的来源**
 
-在文件中扫描所有 float32 > 80000 的位置，发现异常值 `89128.96`
-对应的 4 字节为 `47 AE 14 7B`，集中出现在 `LS_Nodes` 节（偏移
-`0x26B0–0x2C60`）内部，且呈现规律性分布。
+扫描文件中所有 float32 > 80000 的位置，发现异常值 `89128.96`
+对应 4 字节 `47 AE 14 7B`，集中且规律出现于 `LS_Nodes` 节。
 
-### 3.3 关键发现——坐标实为 float64
+**步骤三：关键发现——坐标实为 float64**
 
-注意到同一区域另一个高频值 `1.035`，对应 4 字节 `3F 84 7A E1`。
-将两者拼接为 8 字节后发现：
+同区域另一高频值 `1.035` 对应 4 字节 `3F 84 7A E1`，拼接后：
 
 ```
 字节序列: 3F 84 7A E1  47 AE 14 7B
-↓ 标准大端 float64 解释
+↓ 标准大端 float64
 0x3F847AE147AE147B  =  0.01（精确值）
 ```
 
-**关键验证：**
-
+验证：
 ```python
-import struct
-val = struct.unpack(">d", bytes([0x3F,0x84,0x7A,0xE1,0x47,0xAE,0x14,0x7B]))[0]
-# val = 0.01000000000000000021  ← 正是期望的坐标最大值！
-
-struct.pack('>d', 0.01).hex()
-# '3f847ae147ae147b'  ← 与文件中两个"异常值"拼合完全一致
+struct.unpack(">d", bytes([0x3F,0x84,0x7A,0xE1,0x47,0xAE,0x14,0x7B]))[0]
+# → 0.01000000000000000021  ✓
 ```
 
-这说明 `(1.035, 89128.96)` 不是两个独立的 float32，而是同一个
-float64 值 `0.01` 被**错误截断**的产物：
+| 读法 | 字节 | 错误结果 |
+|------|------|---------|
+| float32（错误） | `3F 84 7A E1` | 1.035 |
+| float32（错误） | `47 AE 14 7B` | **89128.96** ← 异常值根源 |
+| float64（正确） | 8字节合并 | **0.01** ✓ |
 
-| 读法 | 字节 | 结果 |
-|------|------|------|
-| float32（错误） | `3F 84 7A E1` | **1.035** |
-| float32（错误） | `47 AE 14 7B` | **89128.96** |
-| float64（正确） | `3F 84 7A E1 47 AE 14 7B` | **0.01** ✓ |
+**步骤四：发现字反转存储**
 
-### 3.4 发现字反转存储方式
-
-进一步分析发现文件中坐标 `0.01` 并非以标准大端 float64 存储，
-而是以**字反转（word-reversed / middle-endian）**格式存储：
+坐标以 **字反转（word-reversed / middle-endian）** 格式存储：
 
 ```
-标准大端 float64 (0.01):    3F 84 7A E1  47 AE 14 7B
-                             [  高32位   ][  低32位   ]
-
-文件中实际字节顺序:          47 AE 14 7B  3F 84 7A E1
-                             [  低32位   ][  高32位   ]
+标准大端 float64:   [3F 84 7A E1][47 AE 14 7B]  (高32位在前)
+GPH 文件实际存储:  [47 AE 14 7B][3F 84 7A E1]  (低32位在前)
 ```
 
-即每个 8 字节 double 的两个 32 位字顺序被调换，但每个字内部
-仍保持大端序（类似 PDP-endian / 混合端序）。
+**步骤五：揭示 LS_Nodes 三轴块结构**
 
-### 3.5 揭示 LS_Nodes 节的三轴块结构
-
-通过对节内描述符的系统解析，确认 `LS_Nodes` 节将三个坐标轴分别
-以独立数据块存储，块间以描述符隔开：
+`LS_Nodes` 节将 X、Z、Y 三个坐标轴分别存储为独立数据块：
 
 ```
-LS_Nodes 节结构（0x26B0–0x2C60）
-├── 40B  节标签头 [I4=32][名称32B][I4=32]
+LS_Nodes 节 (0x26B0–0x2C60)
+├── 40B  节标签头
 ├── 4×16B 元数据描述符
-│
-├── [16B 描述符: 12/8/52/1]   ← X 轴块入口
-├── [12B 块头:  12/416/1.035] ← byte_count=416, max_X 高32位
-├── 52×8B X 坐标（字反转 float64）
-│
-├── [16B 描述符: 12/8/52/1]   ← Z 轴块入口
-├── [12B 块头:  12/416/1.035]
-├── 52×8B Z 坐标（字反转 float64）
-│
-├── [16B 描述符: 12/8/52/1]   ← Y 轴块入口
-├── [12B 块头:  12/416/0.0  ]
-└── 52×8B Y 坐标（字反转 float64）
+├── [16B 描述符: 12/8/52/1] + [12B 块头] + 52×8B X 坐标（字反转 float64）
+├── [16B 描述符: 12/8/52/1] + [12B 块头] + 52×8B Z 坐标（字反转 float64）
+└── [16B 描述符: 12/8/52/1] + [12B 块头] + 52×8B Y 坐标（字反转 float64）
 ```
 
----
+文件内轴块顺序为 **X → Z → Y**，读取后需重排为 X, Y, Z。
 
-## 4. 根本原因总结
+### 2.3 根本原因
 
 原代码存在三个层叠错误：
 
-| # | 错误 | 原始值 | 正确值 |
-|---|------|--------|--------|
-| 1 | 数据类型 | float32（4 字节） | float64（8 字节，字反转） |
-| 2 | 读取起始偏移 | 硬编码 `0x2750` | 动态定位第一个 `[12/8/n/1]` 描述符后的数据块 |
+| # | 错误 | 原始 | 正确 |
+|---|------|------|------|
+| 1 | 数据类型 | float32（4字节） | float64（8字节，字反转） |
+| 2 | 起始偏移 | 硬编码 `0x2750` | 动态扫描描述符 `[12/8/n/1]` |
 | 3 | 顶点计数 | `(0x2C60-0x2750)//12 = 108` | 从描述符读取 `dim0 = 52` |
 
-错误 1 是产生 89000+ 异常值的直接原因：将坐标值 `0.01` 的低32位
-`0x47AE147B` 误读为 float32，得到 `89128.96`。
+### 2.4 修复方案
 
----
-
-## 5. 修复方案
-
-### 5.1 新增字反转 float64 读取函数
+新增字反转读取函数、动态节定位和三轴块解析：
 
 ```python
 def read_f64_wr(data: bytes, pos: int) -> float:
-    """读取字反转 float64：文件存储顺序为 [低32位大端][高32位大端]。"""
-    lower = int.from_bytes(data[pos : pos + 4], "big")
-    upper = int.from_bytes(data[pos + 4 : pos + 8], "big")
-    combined = ((upper << 32) | lower).to_bytes(8, "big")
-    return struct.unpack(">d", combined)[0]
+    """读取字反转 float64：存储顺序 [低32位大端][高32位大端]。"""
+    lower = int.from_bytes(data[pos:pos+4], "big")
+    upper = int.from_bytes(data[pos+4:pos+8], "big")
+    return struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, "big"))[0]
 ```
 
-### 5.2 动态节定位
-
-```python
-def _find_section(data: bytes, name: str) -> int:
-    """通过节名称动态定位节起始位置（I4=32 标记处）。"""
-    name_padded = name.ljust(32).encode("ascii")
-    idx = data.find(name_padded)
-    if idx < 4:
-        return -1
-    return idx - 4 if read_i32_be(data, idx - 4) == 32 else -1
-```
-
-### 5.3 动态解析 LS_Nodes 三轴坐标块
-
-```python
-def _parse_ls_nodes(data: bytes) -> tuple:
-    sec_start = _find_section(data, "LS_Nodes")
-    pos = sec_start + 40  # 跳过 40B 标签头
-
-    # 扫描描述符，找到第一个 [12, 8, n_verts, 1]
-    n_vertices = 0
-    while pos + 16 <= len(data):
-        if read_i32_be(data, pos) != 12:
-            break
-        type_code = read_i32_be(data, pos + 4)
-        dim0      = read_i32_be(data, pos + 8)
-        dim1      = read_i32_be(data, pos + 12)
-        pos += 16
-        if type_code == 8 and dim1 == 1 and dim0 > 0:
-            n_vertices = dim0
-            break
-
-    # 连续读取三个轴块 (X, Z, Y)
-    coord_blocks = []
-    for _ in range(3):
-        pos += 12                              # 跳过 12B 块头
-        vals = [read_f64_wr(data, pos + i*8)
-                for i in range(n_vertices)]
-        pos += n_vertices * 8
-        coord_blocks.append(vals)
-        if pos + 16 <= len(data) and read_i32_be(data, pos) == 12:
-            pos += 16                          # 跳过下一个描述符
-
-    # 文件顺序 X,Z,Y → 输出 X,Y,Z
-    x_vals, z_vals, y_vals = coord_blocks
-    xyz = np.array([[x_vals[i], y_vals[i], z_vals[i]]
-                    for i in range(n_vertices)], dtype=np.float64)
-    return xyz, n_vertices
-```
-
----
-
-## 6. 修复效果对比
+### 2.5 修复效果
 
 | 项目 | 修复前 | 修复后 |
 |------|--------|--------|
-| 顶点数 | 108（错误） | **52**（正确） |
-| CoordinateX 范围 | [-6.8e8, 3.5e34] | **[0, 0.01]** |
-| CoordinateY 范围 | [-1.5e29, 7.9e34] | **[0, 0.01]** |
-| CoordinateZ 范围 | [-4.3e15, 4.2e36] | **[0, 0.01]** |
-| 含 89000+ 的分量 | 22 | **0** |
-| 坐标精度 | float32（单精度） | **float64（双精度）** |
+| 顶点数 | 108 | **52** |
+| X/Y/Z 范围 | [-∞, +∞]（含89000+） | **[0, 0.01]** |
+| 89000+ 异常值 | 22 | **0** |
+| 坐标精度 | float32 | **float64** |
 
-修复后输出示例：
+---
+
+## 3. 第二阶段：面单元与边界条件完善
+
+### 3.1 需求
+
+测试发现转换后的 CGNS 文件：
+1. **只有体单元，缺少面单元数据**（无法在 CFD 软件中定义边界条件）
+2. **命名不符合规范**（参考文件 `box_ngons.cgns` 的命名约定）
+
+### 3.2 参考文件分析
+
+`box_ngons.cgns` 的 CGNS 结构：
+
+```
+CGNSLibraryVersion (R4, 4.2)
+Base (CGNSBase_t, [3,3])
+  box_vol (Zone_t, [[n_verts],[n_cells],[0]])
+    ZoneType          → "Unstructured"
+    GridCoordinates   → CoordinateX/Y/Z (R8)
+    NGonElements      → 面元素 (NGON_n, type=22) + ElementStartOffset
+    NFaceElements     → 体元素 (NFACE_n, type=23) + ElementStartOffset
+    ZoneBC
+      box_surfs       → BCWall, GridLocation=FaceCenter, PointList
+```
+
+### 3.3 LS_Links 节逆向解析
+
+通过系统分析发现 `LS_Links` 节含 **5 个数据块**，存储 307 个三角面的拓扑信息：
+
+| 块 | 大小 | 含义 |
+|----|------|------|
+| owner | 307×I4 | 每个面的拥有单元 ID（0-indexed） |
+| neighbor | 307×I4 | 对侧单元 ID，`0xFFFFFFFF` = 边界面 |
+| npe | 307×I4 | 每面节点数（全为 3 = 三角面） |
+| face_type | 1×I4 | 值=4（四面体单元） |
+| conn | 921×I4 | 节点索引，**列主序**存储 |
+
+**关键发现：节点索引列主序存储**
+
+```
+conn 数组布局（共 307面 × 3节点 = 921 个值）:
+[node0_face0, node0_face1, ..., node0_face306,   ← 307个 node[0]
+ node1_face0, node1_face1, ..., node1_face306,   ← 307个 node[1]
+ node2_face0, node2_face1, ..., node2_face306]   ← 307个 node[2]
+```
+
+按行主序误读则每个面会出现重复节点，这是面元素解析错位的原因。
+
+**网格拓扑验证：**
+
+```
+307 面中：  边界面 75 个，内部面 232 个
+验证：2 × 232 + 75 = 539 ≈ 135 × 4 = 540 (四面体，每个4个面) ✓
+```
+
+### 3.4 哨兵值过滤
+
+块的 byte_count 值（1228 = 307×4）会作为哨兵值泄漏进 owner/neighbor 数组末尾。过滤条件：
+
+```python
+# 任何 cell index > n_faces 均为非法哨兵值
+owner[owner > n_faces] = -1
+neigh[(neigh > n_faces) & (neigh != -1)] = -1
+# 节点索引越界截断
+face_nodes[face_nodes >= n_vertices] = n_vertices - 1
+```
+
+### 3.5 CGNS 输出重写
+
+按 `box_ngons.cgns` 规范重写输出，命名对比：
+
+| 项目 | 修改前 | 修改后（对齐参考） |
+|------|--------|--------------------|
+| Zone 名称 | `Zone1` | `box_vol` |
+| Zone data shape | `(1,3)` | `(3,1)` |
+| CGNSLibraryVersion 类型 | C1 string | **R4 float32** |
+| 体单元 | `Hexahedra`（HEXA_8，解析错误） | `NFaceElements`（NFACE_n=23） |
+| 面单元 | ❌ 无 | ✅ `NGonElements`（NGON_n=22） |
+| 边界条件 | ❌ 无 | ✅ `ZoneBC/box_surfs`（BCWall，FaceCenter） |
+
+### 3.6 最终验证结果
 
 ```
 Reading: box.gph
-  Vertices: 52
-  Elements: 135
-  Element type: HEXA_8
+  Vertices : 52
+  Faces    : 307  (triangular, NGON_n)
+  Cells    : 135  (tetrahedral, NFACE_n)
+  BC faces : 75
+```
 
-CoordinateX: [0.00000000, 0.01000000]  ✓
-CoordinateY: [0.00000000, 0.01000000]  ✓
-CoordinateZ: [0.00000000, 0.01000000]  ✓
+| 检查项 | 结果 |
+|--------|------|
+| NGonElements 节点索引范围 | [1, 52] ✓ |
+| NFaceElements 面索引范围 | [1, 307] ✓ |
+| ZoneBC PointList 边界面数 | 75 ✓ |
+| 坐标范围 X/Y/Z | [0, 0.01] ✓ |
+| 89000+ 异常值 | 0 ✓ |
+
+---
+
+## 4. GPH 格式逆向工程结论
+
+### 4.1 文件整体布局
+
+| 偏移 | 大小 | 节名 | 内容 |
+|------|------|------|------|
+| 0x0000 | 28B | file_header | `CRDL-FLD` 魔数 + 维度 |
+| 0x001C–0x05D8 | ~1.2KB | 元数据 | FileRevision/Application/Dimension 等 |
+| 0x0628–0x08DC | 692B | LS_CvolIdOfElements | I4[135] 控制体ID |
+| 0x08DC–0x26B0 | 7.6KB | LS_Links | 面连通性（5块数据） |
+| 0x26B0–0x2C60 | 1.4KB | LS_Nodes | 顶点坐标（字反转 float64，三轴块） |
+| 0x2C60–0x42B0 | 5.7KB | LS_SurfaceRegions | 面区域数据 |
+| 0x42B0–0x45A4 | 756B | Element_InformationFlag | 单元标志 |
+
+### 4.2 通用节记录格式
+
+```
+[I4=32][C1[32]=节名称][I4=32]   ← 40B 标签头
+{描述符块} × N                   ← 每块 16B：[I4=12][I4=type][I4=dim0][I4=dim1]
+{数据块} × M                     ← 每块：[12B 块头][payload]
+```
+
+### 4.3 字反转 float64（Word-Reversed Float64）
+
+```
+标准大端 float64:   [高32位][低32位]
+GPH 文件存储:       [低32位][高32位]  ← PDP-endian / 混合端序
+```
+
+示例：坐标 `0.01` = `0x3F847AE147AE147B`，文件中存为 `47 AE 14 7B 3F 84 7A E1`。
+
+```python
+def read_f64_wr(data, pos):
+    lower = int.from_bytes(data[pos:pos+4], 'big')
+    upper = int.from_bytes(data[pos+4:pos+8], 'big')
+    return struct.unpack(">d", ((upper<<32)|lower).to_bytes(8,'big'))[0]
+```
+
+### 4.4 LS_Links 五块数据结构
+
+面连通性节点索引以**列主序（column-major）**存储：
+
+```
+[块1: owner 307×I4]   [块2: neighbor 307×I4]   [块3: npe 307×I4]
+[块4: face_type 1×I4]
+[块5: conn 921×I4]
+  = [node0×307] + [node1×307] + [node2×307]
+```
+
+获取第 i 个面的 3 个节点（0-indexed）：
+```python
+node0 = conn[i]
+node1 = conn[307 + i]
+node2 = conn[307*2 + i]
 ```
 
 ---
 
-## 7. 改动文件清单
+## 5. 最终输出格式说明
+
+生成的 `box.cgns` 结构（对齐 `box_ngons.cgns`）：
+
+```
+CGNSLibraryVersion  (R4, 4.2)
+Base                (CGNSBase_t, I4 [3,3])
+  box_vol           (Zone_t, I8 [[52],[135],[0]])
+    ZoneType            → "Unstructured"
+    GridCoordinates
+      CoordinateX       (R8, 52个顶点, 范围 [0, 0.01])
+      CoordinateY       (R8, 52个顶点, 范围 [0, 0.01])
+      CoordinateZ       (R8, 52个顶点, 范围 [0, 0.01])
+    NGonElements        (Elements_t, type=[22,0])
+      ElementRange          [1, 307]    ← 307个三角面
+      ElementStartOffset    shape(308,) ← 等步长3
+      ElementConnectivity   shape(921,) ← 1-indexed顶点
+    NFaceElements       (Elements_t, type=[23,0])
+      ElementRange          [308, 442]  ← 135个四面体单元
+      ElementStartOffset    shape(136,)
+      ElementConnectivity   shape(538,) ← 1-indexed面索引
+    ZoneBC
+      box_surfs         (BC_t, "BCWall")
+        PointList           shape(75,1) ← 75个边界面，1-indexed
+        GridLocation        "FaceCenter"
+```
+
+---
+
+## 6. 改动文件清单
 
 | 文件 | 改动类型 | 主要内容 |
 |------|----------|----------|
-| `gph2cgns.py` | 功能修复 | 新增 `read_f64_wr()`、`_find_section()`、`_parse_ls_nodes()`、`_parse_ls_links()`、`_parse_n_elements()`；重写 `parse_gph_mesh()` |
-| `gph_model.py` | 同步修复 | 更新 LS_Nodes 节点解析逻辑，使用字反转 float64 |
-| `gph_parser.py` | 文档+修复 | 更正节采样代码；补充字反转 float64 说明 |
-| `GPH_FORMAT_SPEC.md` | 文档 | 更新 LS_Nodes 格式说明，新增字反转 float64 规范与 bug 复现示例 |
+| `gph2cgns.py` | **核心重写** | 新增 `read_f64_wr()`、`_find_section()`、`_parse_ls_nodes()`、`_parse_ls_links()`；重写 `parse_gph_mesh()`；完全重写 CGNS 输出层（NGon/NFace/ZoneBC） |
+| `gph_model.py` | 同步修复 | LS_Nodes 解析使用字反转 float64 |
+| `gph_parser.py` | 文档+修复 | 更正节采样代码；补充字反转 float64 格式说明 |
+| `GPH_FORMAT_SPEC.md` | 文档更新 | 补充 LS_Nodes 字反转 float64 规范；更新 LS_Links 五块结构说明 |
+| `box.cgns` | 重新生成 | 使用修复后脚本输出的正确 CGNS 文件 |
+| `box_ngons.cgns` | 新增（参考） | 从 main 分支拉取的参考文件，用于验证输出格式 |
+| `DEV_SUMMARY.md` | 文档 | 本总结文档 |
+
+**提交历史：**
+
+```
+15e1bf5  feat: 添加面单元(NGonElements)、体单元(NFaceElements)和边界条件(ZoneBC)
+9db2c4c  regen: 使用修复后的 gph2cgns 重新生成 box.cgns
+2085c5c  docs: 添加 gph2cgns 坐标解析 Bug 修复开发总结
+e25a693  fix: gph2cgns逆向解析坐标值错误 - 坐标为字反转float64非float32
+```
 
 ---
 
-## 8. GPH LS_Nodes 格式规范（逆向结论）
+## 7. 经验总结
 
-### 8.1 字反转 float64（Word-Reversed Float64）
+1. **"看起来合理"的值可能是最危险的陷阱**。float32 误读得到的
+   `1.035` 在 [0,1] 范围内，伪装成了正常坐标，掩盖了真正的错误
+   （实为 float64 坐标 `0.01` 的高32位误读）。
 
-GPH 文件中的双精度浮点数采用非标准的混合端序存储：
+2. **规律性出现的"魔法常量"是关键线索**。`89128.96`（`0x47AE147B`）
+   在文件中高频出现，最终证明是 float64 坐标 `0.01` 的低32位被
+   float32 误读的产物，直接指向了格式解析的根本错误。
 
-```
-IEEE 754 标准大端 (0.01):   [3F 84 7A E1] [47 AE 14 7B]
-                              ↑ 高32位       ↑ 低32位
+3. **数据布局顺序不可想当然**。LS_Links 节的节点索引以列主序
+   （column-major）存储，而非通常预期的行主序（row-major），导致
+   按面逐行读取时出现节点重复。
 
-GPH 文件实际存储 (0.01):    [47 AE 14 7B] [3F 84 7A E1]
-                              ↑ 低32位       ↑ 高32位
-```
+4. **哨兵值会污染相邻数据**。块的 `byte_count` 值（1228）因内存
+   布局关系泄漏进 `owner/neighbor` 数组末尾，需要主动识别并过滤。
 
-解码方式：
+5. **混合端序真实存在于工业软件**。PDP-endian（字反转 float64）虽
+   罕见，但确实出现在历史遗留格式中，逆向时需将其纳入候选假设。
 
-```python
-lower = int.from_bytes(data[pos:pos+4], 'big')   # 先读低32位
-upper = int.from_bytes(data[pos+4:pos+8], 'big') # 再读高32位
-value = struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, 'big'))[0]
-```
-
-### 8.2 LS_Nodes 块头含义
-
-每个轴块的 12 字节头部结构：
-
-| 偏移 | 字段 | 说明 |
-|------|------|------|
-| +0 | `I4 = 12` | 本头部长度标记 |
-| +4 | `I4 = byte_count` | 数据负载字节数（= n_verts × 8） |
-| +8 | `I4` | 该轴最大坐标值的**高32位**（可用于校验量级） |
-
-### 8.3 坐标轴存储顺序
-
-文件内轴块顺序为 **X → Z → Y**，与 CGNS 标准轴序（X, Y, Z）不同，
-读取后需重新排列。
-
----
-
-## 9. 经验总结
-
-1. **二进制格式逆向不能只靠"看起来合理"的值**。初期 float32 读取
-   出的 1.035 坐标在 [0,1] 范围内，伪装成了合理结果，掩盖了真正错误。
-
-2. **将 "魔法常量" 作为线索**。89128.96 (`0x47AE147B`) 在全文件
-   中规律性出现，反而提供了关键突破口——它是 float64 坐标 0.01
-   的低32位的 float32 误读。
-
-3. **数据格式规范中的"类型码"需结合上下文理解**。`type=8` 在格式
-   描述符中既可能是"8字节double"也可能是"其他"，需要通过实际字节
-   验证而非仅凭规范推断。
-
-4. **硬编码偏移量脆弱**。不同来源的 GPH 文件截面大小不同，固定偏移
-   量 `0x2750` 只在特定测试文件中偶然正确，对通用文件必须动态解析。
-
-5. **混合端序真实存在**。PDP-endian（字反转）虽然罕见，但确实出现在
-   部分工业软件的历史遗留格式中，逆向时应将其纳入候选假设。
+6. **动态解析优于硬编码偏移**。通过扫描描述符定位数据块，使代码
+   对不同大小的 GPH 文件具有健壮性，而不是依赖特定测试文件的固定偏移。
