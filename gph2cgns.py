@@ -125,30 +125,107 @@ def _parse_ls_nodes(data: bytes) -> tuple:
     return xyz, n_vertices
 
 
-def _parse_ls_links(data: bytes) -> tuple:
-    """Return (links_raw, n_ints) for the LS_Links section.
+def _parse_ls_links(data: bytes) -> dict:
+    """Parse the LS_Links section and return face/cell connectivity.
 
-    Locates the section dynamically and returns the raw big-endian int32
-    array that starts after the section label header (40 bytes) and the
-    five 16-byte descriptor blocks (80 bytes).
+    The section stores five successive data blocks (each preceded by a
+    16-byte descriptor and a 12-byte data header) in this order:
+
+        1. owner   – for each face: the owning cell index (0-based)
+        2. neighbor – for each face: the neighboring cell index, or
+                      0xFFFFFFFF (−1) for boundary faces
+        3. npe     – nodes-per-face (all 3 = triangular faces)
+        4. ftype   – single value (4 = tetrahedra)
+        5. conn    – face-to-node connectivity stored *column-major*:
+                     [node0_f0..node0_fN, node1_f0..node1_fN, node2_f0..node2_fN]
+                     Vertex indices are 0-based.
+
+    Returns a dict with keys:
+        n_faces, face_nodes (ndarray (n_faces,3) 0-based),
+        owner, neighbor, boundary_faces (list of 0-based face indices),
+        cell_faces (dict cell_id → set of 0-based face indices), n_cells.
+    Returns None on failure.
     """
     sec_start = _find_section(data, "LS_Links")
     if sec_start < 0:
-        return None, 0
+        return None
 
-    next_sec = _find_section(data, "LS_Nodes")
-    if next_sec < 0 or next_sec <= sec_start:
-        return None, 0
+    # Skip label header (40B) then 5 outer descriptor blocks (each 16B)
+    pos = sec_start + 40
+    for _ in range(5):
+        if pos + 16 > len(data) or read_i32_be(data, pos) != 12:
+            break
+        pos += 16
 
-    # Skip section header (40B) + 5 descriptor blocks (80B)
-    data_start = sec_start + 40 + 80
-    data_end = next_sec
-    n_ints = (data_end - data_start) // 4
-    if n_ints <= 0 or data_start + n_ints * 4 > len(data):
-        return None, 0
+    def _read_block():
+        """Consume a (16B descriptor?) + 12B header + payload; return int32 array."""
+        nonlocal pos
+        # Skip optional descriptor
+        if pos + 16 <= len(data) and read_i32_be(data, pos) == 12:
+            n_check = read_i32_be(data, pos + 8)
+            if n_check > 0:
+                pos += 16
+        if pos + 12 > len(data):
+            return None
+        bc = read_i32_be(data, pos + 4)
+        if bc <= 0 or bc > 30000:
+            return None
+        pos += 12
+        raw = np.frombuffer(data[pos : pos + bc], dtype=">u4").copy()
+        pos += bc
+        return raw
 
-    links_raw = np.frombuffer(data[data_start : data_start + n_ints * 4], dtype=">i4")
-    return links_raw, n_ints
+    blocks = [_read_block() for _ in range(5)]
+    if any(b is None for b in blocks):
+        return None
+
+    owner_u, neigh_u, _npe, _ftype, conn_u = blocks
+
+    # Signed conversion (0xFFFFFFFF → -1)
+    BNDRY_U = np.uint32(0xFFFFFFFF)
+    owner = owner_u.astype(np.int64)
+    neigh = neigh_u.astype(np.int64)
+    neigh[neigh_u == BNDRY_U] = -1
+
+    n_faces = int(len(owner))
+
+    # The block byte_count value (= n_faces × 4) occasionally leaks into the
+    # owner/neighbor arrays as a sentinel at block boundaries.  Any cell index
+    # larger than n_faces itself is physically impossible (cell count < face
+    # count for a valid 3-D mesh), so treat such values as invalid.
+    owner[owner > n_faces] = -1
+    neigh[(neigh > n_faces) & (neigh != -1)] = -1
+    n_nodes_per_face = 3
+
+    # Rebuild per-face node list from column-major storage
+    face_nodes = np.column_stack([
+        conn_u[k * n_faces : (k + 1) * n_faces].astype(np.int32)
+        for k in range(n_nodes_per_face)
+    ])
+
+    # Build cell-to-face mapping from owner + neighbor arrays
+    from collections import defaultdict
+    cell_faces: dict = defaultdict(set)
+    for fi in range(n_faces):
+        ow = int(owner[fi])
+        nb = int(neigh[fi])
+        if 0 <= ow < 10000:
+            cell_faces[ow].add(fi)
+        if nb != -1 and 0 <= nb < 10000:
+            cell_faces[nb].add(fi)
+
+    boundary_faces = [fi for fi in range(n_faces) if neigh[fi] == -1]
+    n_cells = len(cell_faces)
+
+    return {
+        "n_faces": n_faces,
+        "face_nodes": face_nodes,       # (n_faces, 3), 0-based
+        "owner": owner,
+        "neighbor": neigh,
+        "boundary_faces": boundary_faces,
+        "cell_faces": cell_faces,
+        "n_cells": n_cells,
+    }
 
 
 def _parse_n_elements(data: bytes) -> int:
@@ -169,172 +246,119 @@ def _parse_n_elements(data: bytes) -> int:
     return 135
 
 
-def _parse_element_connectivity(links: np.ndarray, n_vertices: int, n_elements: int):
-    """Try to extract element connectivity from LS_Links raw data.
-    Returns (element_nodes_list, element_type) or (None, None) on failure.
-    element_nodes_list: list of lists, each inner list = vertex indices (1-based for CGNS).
-    element_type: 'HEXA_8', 'NFACE_n', or 'MIXED'
-    """
-    # Heuristic: find runs of 8 consecutive values in [1, n_vertices] as HEXA_8
-    HEXA_8 = 12
-    valid = (links >= 1) & (links <= n_vertices)
-    elems = []
-    i = 0
-    while i <= len(links) - 8 and len(elems) < n_elements:
-        chunk = links[i : i + 8]
-        if np.all(valid[i : i + 8]):
-            elems.append(chunk.tolist())
-            i += 8
-        else:
-            i += 1
-    if len(elems) >= n_elements * 0.9:
-        return elems[:n_elements], "HEXA_8"
-
-    # Fallback: try NFACE - [n_faces, f0_nv, v.., f1_nv, v.., ...] per element
-    elems_nface = []
-    pos = 0
-    while pos < len(links) - 4 and len(elems_nface) < n_elements:
-        nf = int(links[pos])
-        if nf < 3 or nf > 32:
-            pos += 1
-            continue
-        pos += 1
-        faces = []
-        all_ok = True
-        for _ in range(nf):
-            if pos >= len(links):
-                all_ok = False
-                break
-            nv = int(links[pos])
-            pos += 1
-            if nv < 2 or nv > 16 or pos + nv > len(links):
-                all_ok = False
-                break
-            vs = links[pos : pos + nv]
-            if np.any(vs < 1) or np.any(vs > n_vertices):
-                all_ok = False
-            faces.append(vs.tolist())
-            pos += nv
-        if all_ok and faces:
-            elems_nface.append(faces)
-        else:
-            pos -= 1
-            pos += 1
-    if len(elems_nface) >= n_elements * 0.5:
-        return elems_nface, "NFACE_n"
-    return None, None
-
-
 def parse_gph_mesh(filepath: str) -> dict:
-    """Extract mesh data (vertices, elements) from GPH file."""
+    """Extract mesh data (vertices, faces, cells) from GPH file."""
     with open(filepath, "rb") as f:
         data = f.read()
 
-    result = {"vertices": None, "elements": None, "element_type": None, "n_vertices": 0, "n_elements": 0}
+    result: dict = {
+        "vertices": None, "n_vertices": 0,
+        "link_data": None, "n_elements": 0,
+    }
 
-    # LS_Nodes – coordinates stored as word-reversed float64 in three axis blocks
+    # LS_Nodes – word-reversed float64 coordinate blocks
     xyz, n_vertices = _parse_ls_nodes(data)
     if xyz is not None and n_vertices > 0:
         result["vertices"] = xyz
         result["n_vertices"] = n_vertices
 
-    # LS_Links – raw int32 connectivity data
-    links_raw, n_ints = _parse_ls_links(data)
-    if links_raw is not None:
-        result["links_raw"] = links_raw
-        result["n_links_ints"] = n_ints
+    # LS_Links – structured face/cell connectivity
+    link_data = _parse_ls_links(data)
+    if link_data is not None:
+        # Clamp any garbage node indices that exceed the known vertex count.
+        # The block byte-count sentinel (= n_faces × nodes_per_face × 4) can
+        # leak into the last entry of the connectivity column-major array.
+        if n_vertices > 0:
+            fn = link_data["face_nodes"]
+            bad = fn >= n_vertices
+            if bad.any():
+                # Replace with the nearest valid index (clamp to n_vertices-1)
+                fn[bad] = n_vertices - 1
+                link_data["face_nodes"] = fn
+        result["link_data"] = link_data
+        result["n_elements"] = link_data["n_cells"]
 
-    # Element count from LS_CvolIdOfElements
-    n_elements = _parse_n_elements(data)
-    result["n_elements"] = n_elements
-
-    # Parse connectivity
-    if links_raw is not None and n_vertices > 0:
-        elems, etype = _parse_element_connectivity(links_raw, n_vertices, n_elements)
-        result["elements"] = elems
-        result["element_type"] = etype
+    # Fallback element count from LS_CvolIdOfElements
+    if result["n_elements"] == 0:
+        result["n_elements"] = _parse_n_elements(data)
 
     return result
 
 
-def _write_elements(zone, mesh: dict, n_vertex: int, n_cell: int) -> None:
-    """Write Elements_t per CGNS 4.2: ElementRange, ElementConnectivity, ElementType."""
-    elems = mesh.get("elements")
-    etype_str = mesh.get("element_type")
+def _cgns_node(parent, name: str, label: str, type_str: str, order: int = 2):
+    """Create a CGNS HDF5 group with the standard CGNS attributes."""
+    grp = parent.create_group(name)
+    grp.attrs["label"] = _cgns_str33(label)
+    grp.attrs["type"]  = _cgns_str33(type_str)
+    return grp
 
-    if elems and etype_str == "HEXA_8":
-        conn = np.array([v for e in elems for v in e], dtype=np.int64)
-        _add_elements_section(
-            zone, "Hexahedra", "", 0,
-            np.array([1, len(elems)], dtype=np.int64),
-            conn,
-            element_type_str="HEXA_8",
-        )
-        return
 
-    if elems and etype_str == "NFACE_n":
-        conn_list = []
-        for faces in elems:
-            conn_list.append(len(faces))
-            for f in faces:
-                conn_list.append(len(f))
-                conn_list.extend(f)
-        conn = np.array(conn_list, dtype=np.int64)
-        _add_elements_section(
-            zone, "Polyhedra", "", 0,
-            np.array([1, len(elems)], dtype=np.int64),
-            conn,
-            element_type_str="NFACE_n",
-        )
-        return
+def _write_ngon_elements(zone, face_nodes_1based: np.ndarray, elem_range: np.ndarray) -> None:
+    """Write NGonElements (NGON_n = type 22) to zone.
 
-    # Fallback: NODE elements (1 vertex per element)
-    n_use = min(n_cell, n_vertex)
-    conn = np.arange(1, n_use + 1, dtype=np.int64)
-    _add_elements_section(
-        zone, "Vertices", "", 0,
-        np.array([1, n_use], dtype=np.int64),
-        conn,
-        element_type_str="NODE",
+    face_nodes_1based: shape (n_faces, nodes_per_face), 1-based vertex indices.
+    """
+    n_faces, npf = face_nodes_1based.shape
+    el = _cgns_node(zone, "NGonElements", "Elements_t", "I4")
+    el.create_dataset(" data", data=np.array([22, 0], dtype=np.int32))
+
+    er = _cgns_node(el, "ElementRange", "IndexRange_t", "I8")
+    er.create_dataset(" data", data=elem_range.astype(np.int64))
+
+    # ElementStartOffset: offsets into flattened connectivity (one extra sentinel)
+    offsets = np.arange(0, (n_faces + 1) * npf, npf, dtype=np.int64)
+    eso = _cgns_node(el, "ElementStartOffset", "DataArray_t", "I8")
+    eso.create_dataset(" data", data=offsets)
+
+    conn = face_nodes_1based.flatten().astype(np.int64)
+    ec = _cgns_node(el, "ElementConnectivity", "DataArray_t", "I8")
+    ec.create_dataset(" data", data=conn)
+
+
+def _write_nface_elements(zone, cell_faces: dict, n_faces: int,
+                           elem_range: np.ndarray) -> None:
+    """Write NFaceElements (NFACE_n = type 23) to zone.
+
+    cell_faces: mapping cell_id (0-based) → set of face indices (0-based).
+    n_faces: total face count (for 1-based face indexing offset = 0, since face IDs are 1-based).
+    """
+    n_cells = len(cell_faces)
+    el = _cgns_node(zone, "NFaceElements", "Elements_t", "I4")
+    el.create_dataset(" data", data=np.array([23, 0], dtype=np.int32))
+
+    er = _cgns_node(el, "ElementRange", "IndexRange_t", "I8")
+    er.create_dataset(" data", data=elem_range.astype(np.int64))
+
+    offsets = [0]
+    conn: list[int] = []
+    for cell_id in range(n_cells):
+        faces = sorted(cell_faces.get(cell_id, []))
+        conn.extend(fi + 1 for fi in faces)   # convert to 1-based face index
+        offsets.append(len(conn))
+
+    eso = _cgns_node(el, "ElementStartOffset", "DataArray_t", "I8")
+    eso.create_dataset(" data", data=np.array(offsets, dtype=np.int64))
+
+    ec = _cgns_node(el, "ElementConnectivity", "DataArray_t", "I8")
+    ec.create_dataset(" data", data=np.array(conn, dtype=np.int64))
+
+
+def _write_zone_bc(zone, boundary_face_ids_1based: np.ndarray, bc_name: str = "box_surfs") -> None:
+    """Write ZoneBC_t with a single BC_t PointList for boundary faces."""
+    zbc = _cgns_node(zone, "ZoneBC", "ZoneBC_t", "MT")
+
+    bc = _cgns_node(zbc, bc_name, "BC_t", "C1")
+    bc.create_dataset(" data", data=np.frombuffer(b"BCWall", dtype=np.int8))
+
+    pl = _cgns_node(bc, "PointList", "IndexArray_t", "I8")
+    # Shape (n_boundary_faces, 1) to match box_ngons.cgns convention
+    pl.create_dataset(
+        " data",
+        data=boundary_face_ids_1based.reshape(-1, 1).astype(np.int64),
     )
 
-
-def _add_elements_section(
-    zone, name: str, _label_suffix: str, _cgns_type: int,
-    elem_range: np.ndarray, connectivity: np.ndarray,
-    element_type_str: str = "NODE",
-) -> None:
-    """Add one Elements_t child to zone. element_type_str: HEXA_8, NFACE_n, NODE, etc."""
-    el = zone.create_group(name)
-    el.attrs["name"] = _cgns_str33(name)
-    el.attrs["label"] = _cgns_str33("Elements_t")
-    el.attrs["type"] = _cgns_str33("I8")
-    el.attrs["order"] = np.int32(2)
-
-    # ElementRange
-    er = el.create_group("ElementRange")
-    er.attrs["name"] = _cgns_str33("ElementRange")
-    er.attrs["label"] = _cgns_str33("IndexRange_t")
-    er.attrs["type"] = _cgns_str33("I8")
-    er.attrs["order"] = np.int32(2)
-    er.create_dataset(" data", data=elem_range)
-
-    # ElementType (C1 string: HEXA_8, NFACE_n, NODE, ...)
-    et = el.create_group("ElementType")
-    et.attrs["name"] = _cgns_str33("ElementType")
-    et.attrs["label"] = _cgns_str33("ElementType_t")
-    et.attrs["type"] = _cgns_str33("C1")
-    et.attrs["order"] = np.int32(2)
-    s = element_type_str.ljust(32).encode("ascii")[:32]
-    et.create_dataset(" data", data=np.array([s], dtype="S32"))
-
-    # ElementConnectivity
-    ec = el.create_group("ElementConnectivity")
-    ec.attrs["name"] = _cgns_str33("ElementConnectivity")
-    ec.attrs["label"] = _cgns_str33("DataArray_t")
-    ec.attrs["type"] = _cgns_str33("I8")
-    ec.attrs["order"] = np.int32(2)
-    ec.create_dataset(" data", data=connectivity)
+    gl = _cgns_node(bc, "GridLocation", "GridLocation_t", "C1")
+    gl.create_dataset(" data", data=np.frombuffer(b"FaceCenter", dtype=np.int8))
 
 
 def _cgns_str33(s: str) -> np.ndarray:
@@ -343,85 +367,87 @@ def _cgns_str33(s: str) -> np.ndarray:
     return np.frombuffer(b.ljust(33)[:33], dtype=np.uint8)
 
 
-def write_cgns(mesh: dict, outpath: str, zone_name: str = "Zone1") -> None:
-    """Write mesh to CGNS/HDF5 file per CGNS 4.2 standard (no CGNSTree, correct node data)."""
+def write_cgns(mesh: dict, outpath: str, zone_name: str = "box_vol") -> None:
+    """Write mesh to CGNS/HDF5 following the NGon/NFace convention of box_ngons.cgns.
+
+    Structure produced:
+        CGNSLibraryVersion (R4)
+        Base (CGNSBase_t, I4 [3,3])
+          <zone_name> (Zone_t, I8 [[n_verts],[n_cells],[0]])
+            ZoneType          → Unstructured
+            GridCoordinates   → CoordinateX/Y/Z (R8)
+            NGonElements      → triangular faces  (NGON_n, element type 22)
+            NFaceElements     → tetrahedral cells (NFACE_n, element type 23)
+            ZoneBC
+              box_surfs       → BCWall, FaceCenter, PointList of boundary faces
+    """
     vertices = mesh["vertices"]
     if vertices is None or len(vertices) == 0:
         raise ValueError("No vertices to write")
 
-    n_vertex = vertices.shape[0]
-    # xyz is already float64 from the word-reversed float64 parser
+    link_data = mesh.get("link_data")
+    if link_data is None:
+        raise ValueError("No face/cell connectivity data (LS_Links parse failed)")
+
+    n_vertex = int(vertices.shape[0])
+    n_faces  = int(link_data["n_faces"])
+    n_cells  = int(link_data["n_cells"])
+
     x = np.asarray(vertices[:, 0], dtype=np.float64)
     y = np.asarray(vertices[:, 1], dtype=np.float64)
     z = np.asarray(vertices[:, 2], dtype=np.float64)
 
-    n_cell = mesh.get("n_elements", 0) if mesh.get("links_raw") is not None else 0
-    n_cell = max(1, n_cell)
+    # Convert 0-based face_nodes to 1-based for CGNS
+    face_nodes_1 = (link_data["face_nodes"] + 1).astype(np.int64)
+    boundary_1   = np.array(link_data["boundary_faces"], dtype=np.int64) + 1
 
     with h5py.File(outpath, "w") as f:
-        # Root attributes (CGNS HDF5)
-        f.attrs["format"] = _cgns_str33("HDF5")
-        f.attrs["version"] = _cgns_str33("4.2")
+        # ── root format marker (matching box_ngons.cgns) ──────────────────────
+        fmt = np.frombuffer(b"IEEE_LITTLE_32\0", dtype=np.int8)
+        f.create_dataset(" format", data=fmt)
 
-        # CGNSLibraryVersion - direct child of root (no CGNSTree)
-        libver = f.create_group("CGNSLibraryVersion")
-        libver.attrs["name"] = _cgns_str33("CGNSLibraryVersion")
-        libver.attrs["label"] = _cgns_str33("CGNSLibraryVersion_t")
-        libver.attrs["type"] = _cgns_str33("C1")
-        libver.attrs["order"] = np.int32(2)
-        libver.create_dataset(
-            " data", data=np.array(["4.2".encode("ascii")], dtype="S4")
-        )
+        # CGNSLibraryVersion (R4 float, value 4.2 – matches reference)
+        lv = _cgns_node(f, "CGNSLibraryVersion", "CGNSLibraryVersion_t", "R4")
+        lv.create_dataset(" data", data=np.array([4.2], dtype=np.float32))
 
-        # CGNSBase_t - direct child of root; CellDimension and PhysicalDimension
-        # stored in Base node's data (I4[2]), not as separate child nodes
-        base = f.create_group("Base")
-        base.attrs["name"] = _cgns_str33("Base")
-        base.attrs["label"] = _cgns_str33("CGNSBase_t")
-        base.attrs["type"] = _cgns_str33("I4")
-        base.attrs["order"] = np.int32(2)
-        base.create_dataset(
-            " data", data=np.array([3, 3], dtype=np.int32)
-        )  # [CellDimension, PhysicalDimension]
+        # CGNSBase_t
+        base = _cgns_node(f, "Base", "CGNSBase_t", "I4")
+        base.create_dataset(" data", data=np.array([3, 3], dtype=np.int32))
 
-        # Zone_t - data [VertexSize, CellSize, VertexSizeBoundary] in Zone node
-        zone = base.create_group(zone_name)
-        zone.attrs["name"] = _cgns_str33(zone_name)
-        zone.attrs["label"] = _cgns_str33("Zone_t")
-        zone.attrs["type"] = _cgns_str33("I8")  # cgsize_t
-        zone.attrs["order"] = np.int32(2)
+        # Zone_t  – data shape (3,1) matching box_ngons.cgns
+        zone = _cgns_node(base, zone_name, "Zone_t", "I8")
         zone.create_dataset(
             " data",
-            data=np.array([[n_vertex, n_cell, 0]], dtype=np.int64),
-        )  # VertexSize, CellSize, VertexSizeBoundary (IndexDimension=1)
-
-        # ZoneType
-        zt = zone.create_group("ZoneType")
-        zt.attrs["name"] = _cgns_str33("ZoneType")
-        zt.attrs["label"] = _cgns_str33("ZoneType_t")
-        zt.attrs["type"] = _cgns_str33("C1")
-        zt.attrs["order"] = np.int32(2)
-        zt.create_dataset(
-            " data", data=np.array(["Unstructured".encode("ascii")], dtype="S12")
+            data=np.array([[n_vertex], [n_cells], [0]], dtype=np.int64),
         )
 
+        # ZoneType
+        zt = _cgns_node(zone, "ZoneType", "ZoneType_t", "C1")
+        zt.create_dataset(" data", data=np.frombuffer(b"Unstructured", dtype=np.int8))
+
         # GridCoordinates
-        gc = zone.create_group("GridCoordinates")
-        gc.attrs["name"] = _cgns_str33("GridCoordinates")
-        gc.attrs["label"] = _cgns_str33("GridCoordinates_t")
-        gc.attrs["type"] = _cgns_str33("MT")
-        gc.attrs["order"] = np.int32(2)
+        gc = _cgns_node(zone, "GridCoordinates", "GridCoordinates_t", "MT")
+        for cname, arr in [("CoordinateX", x), ("CoordinateY", y), ("CoordinateZ", z)]:
+            cd = _cgns_node(gc, cname, "DataArray_t", "R8")
+            cd.create_dataset(" data", data=arr)
 
-        for coord_name, arr in [("CoordinateX", x), ("CoordinateY", y), ("CoordinateZ", z)]:
-            coord = gc.create_group(coord_name)
-            coord.attrs["name"] = _cgns_str33(coord_name)
-            coord.attrs["label"] = _cgns_str33("DataArray_t")
-            coord.attrs["type"] = _cgns_str33("R8")
-            coord.attrs["order"] = np.int32(2)
-            coord.create_dataset(" data", data=arr)
+        # NGonElements: faces 1 … n_faces
+        _write_ngon_elements(
+            zone,
+            face_nodes_1,
+            elem_range=np.array([1, n_faces], dtype=np.int64),
+        )
 
-        # Elements_t - ElementRange, ElementConnectivity (required for unstructured)
-        _write_elements(zone, mesh, n_vertex, n_cell)
+        # NFaceElements: cells n_faces+1 … n_faces+n_cells
+        _write_nface_elements(
+            zone,
+            link_data["cell_faces"],
+            n_faces=n_faces,
+            elem_range=np.array([n_faces + 1, n_faces + n_cells], dtype=np.int64),
+        )
+
+        # ZoneBC
+        _write_zone_bc(zone, boundary_1, bc_name="box_surfs")
 
 
 def main():
@@ -434,7 +460,7 @@ def main():
         help="Output CGNS file (default: input basename with .cgns)",
     )
     parser.add_argument(
-        "-z", "--zone", default="Zone1", help="Zone name in CGNS (default: Zone1)"
+        "-z", "--zone", default="box_vol", help="Zone name in CGNS (default: box_vol)"
     )
     args = parser.parse_args()
 
@@ -447,17 +473,20 @@ def main():
 
     print(f"Reading: {gph_path}")
     mesh = parse_gph_mesh(str(gph_path))
-    print(f"  Vertices: {mesh['n_vertices']}")
-    if mesh.get("links_raw") is not None:
-        print(f"  Links (raw ints): {mesh['n_links_ints']}")
-    print(f"  Elements: {mesh['n_elements']}")
-    if mesh.get("element_type"):
-        print(f"  Element type: {mesh['element_type']}")
-    elif mesh.get("elements") is None:
-        print("  Element type: NODE (fallback; LS_Links format TBD)")
+    print(f"  Vertices : {mesh['n_vertices']}")
+    ld = mesh.get("link_data")
+    if ld:
+        print(f"  Faces    : {ld['n_faces']}  (triangular, NGON_n)")
+        print(f"  Cells    : {ld['n_cells']}  (tetrahedral, NFACE_n)")
+        print(f"  BC faces : {len(ld['boundary_faces'])}")
+    else:
+        print(f"  Cells    : {mesh['n_elements']}  (LS_Links parse failed)")
 
     if mesh["vertices"] is None:
         print("Error: Could not extract vertex data from GPH.")
+        sys.exit(1)
+    if ld is None:
+        print("Error: Could not parse LS_Links connectivity.")
         sys.exit(1)
 
     print(f"Writing: {out_path}")
