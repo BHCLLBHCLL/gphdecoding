@@ -9,6 +9,7 @@
 5. [最终输出格式说明](#5-最终输出格式说明)
 6. [改动文件清单](#6-改动文件清单)
 7. [经验总结](#7-经验总结)
+8. [第三阶段：ANSA 方言适配 + FLDUTIL 输出对齐](#8-第三阶段ansa-方言适配--fldutil-输出对齐)
 
 ---
 
@@ -366,3 +367,122 @@ e25a693  fix: gph2cgns逆向解析坐标值错误 - 坐标为字反转float64非
 
 6. **动态解析优于硬编码偏移**。通过扫描描述符定位数据块，使代码
    对不同大小的 GPH 文件具有健壮性，而不是依赖特定测试文件的固定偏移。
+
+---
+
+## 8. 第三阶段：ANSA 方言适配 + FLDUTIL 输出对齐
+
+### 8.1 新输入：`box_ansa.gph`
+
+测试文件由 ANSA / 新版 scFLOW 导出，是一个 8 顶点立方体、6 个四面体、
+18 个三角面、12 个边界面。同目录提供官网 `FLDUTIL` 工具生成的参考文件
+`box_ansa_orig.cgns`，作为"金标准"。
+
+### 8.2 GPH 方言差异（旧 SCTpre vs 新 ANSA）
+
+| 维度 | 旧 `box.gph` (SCTpre) | 新 `box_ansa.gph` (ANSA) |
+|---|---|---|
+| `LS_Nodes` 浮点编码 | **标准大端 float64**（与 ANSA 一致） | 标准大端 float64 |
+| `LS_Nodes` 块头 | **8 字节 + 4 字节尾部哨兵** | 8 字节 + 4 字节尾部哨兵 |
+| 轴顺序 | **X, Y, Z**（与 ANSA 一致） | X, Y, Z |
+| `LS_Links` 块数 | 5（含 face_type） | **4（无 face_type）** |
+| `conn` 存储 | 列主序 | **行主序** |
+
+#### 重要修正：原"字反转 float64"理论是误判
+
+第二阶段总结中曾断言旧 `box.gph` 使用字反转 float64 + 12 字节块头。重新验证发现这是**错误推论**：
+
+- 字节序列在 `0x2730` 处实际为 `3f 84 7a e1 47 ae 14 7b ...`，按标准大端 float64 读取得 `0.01` ✓
+- 用字反转读取同样字节得 `1.999e+37` ✗（明显非物理）
+
+历史误判源于原代码 off-by-4 字节偏移（跳过 12 字节而非 8 字节），与字反转读法两次错误"互相抵消"，使**部分**顶点产生看似合理的数值——但大多数顶点本应是 1e37+ 量级。当前实现统一采用"跳 8 字节 + 标准大端"读法。
+
+`gph2cgns.py` 现在通过通用的"数据块扫描器"（识别 `[I4=12][I4=bc][bc 字节][I4=bc 尾部]` 模式）定位每个坐标块，**完全不依赖固定的块头长度**，且仍同时尝试两种浮点编码作为防御性兜底。
+
+### 8.3 FLDUTIL 输出约定（参考 `box_ansa_orig.cgns` 逆向）
+
+| 约定 | 值 |
+|------|----|
+| 根节点属性 | `name="HDF5 MotherNode"`, `label="Root Node of HDF5 File"`, `type="MT"` |
+| 根数据集 | `' hdf5version'`（33 字节零）、`' format'`（`IEEE_LITTLE_32`） |
+| `CGNSLibraryVersion` | R4，值 = **3.21** |
+| 描述符 | `Base/ReferenceState/ReferenceStateDescription` = `"Software Cradle FLDUTIL"` |
+| Zone 数 | **2 个同内容 Zone**：`FluidRegion` 与 `FPHPARTS.box_vol` |
+| Zone 数据类型 | **I4**（int32），不是 I8 |
+| 面单元名 | **`GridElements_Faces`**（NGON_n=22），不是 `NGonElements` |
+| 体单元名 | **与父 Zone 同名**（NFACE_n=23） |
+| 元素/索引数组 dtype | 全部 I4 |
+| NFace 面索引 | **有符号**：cell 为 neighbor 时取负 |
+| NFace 单 cell 排序 | 按 `abs(face_id)` 升序 |
+| BC family 名称 | `box_surfs`，值 = `"Null"`（不是 `"BCWall"`） |
+| `BC_t` 数据 dtype | `int8`，长度 4 |
+| `PointList` 形状 | `(n,)`（一维），不是 `(n, 1)` |
+| `FlowSolution` | 占位节点，仅含 `GridLocation = "CellCenter"` |
+| 组属性 | `flags`(int32×1)、`label`(\|S33)、`name`(\|S33)、`type`(\|S3) |
+
+### 8.4 顶点重排序（first-use ordering）
+
+FLDUTIL 不直接使用 GPH 中的顶点顺序，而是**按面连通性中首次出现顺序**
+重新编号顶点。例如：
+
+```
+GPH conn (row-major, 0-based):
+  f0: [1, 2, 3]   ← 新编号 1, 2, 3
+  f1: [2, 0, 3]   ← 0 首次出现 → 新编号 4
+  f2: [0, 1, 3]   ← 已编号
+  f3: [1, 0, 2]
+  f4: [5, 1, 2]   ← 5 首次出现 → 新编号 5
+  f5: [1, 4, 2]   ← 4 首次出现 → 新编号 6
+  ...
+```
+
+由此得到的顶点排列恰好与官网工具完全一致：
+
+```
+GPH index : 1  2  3  0  5  4  6  7
+CGNS 1-id : 1  2  3  4  5  6  7  8
+```
+
+### 8.5 带符号 NFACE_n 连通性
+
+CGNS NFACE_n 规定：
+
+- 单元拥有（owner）该面 → 正面 ID
+- 单元在该面的另一侧（neighbor）→ 负面 ID
+
+`box_ansa_orig.cgns` 中典型 cell 3 = `[-8, 9, 10, 11]`：
+
+- face 8（gph owner=1, neigh=2）→ cell 2(0-idx) 是 neighbor → `-8`
+- face 9, 10, 11（gph owner=2）→ cell 2 是 owner → 正
+
+每个 cell 的面列表按 `abs(face_id)` 升序排列。
+
+### 8.6 验证结果
+
+```
+Reading: box_ansa.gph
+  Vertices : 8
+  Faces    : 18  (triangular, NGON_n)
+  Cells    : 6   (NFACE_n)
+  BC faces : 12
+Writing: box_ansa.cgns
+Done.
+PERFECT MATCH against box_ansa_orig.cgns
+```
+
+逐字段（`group / dataset / attr / dtype / shape / data`）比较，全部一致。
+
+旧 `box.gph` 回归测试：仍可正确解析 52 顶点、307 面、135 单元；并顺带
+修正了一处边界面 off-by-one（74 而非旧版 75，满足
+`2·233 + 74 = 540 = 4·135` 拓扑恒等式）。
+
+### 8.7 改动文件清单
+
+| 文件 | 改动 |
+|------|------|
+| `gph2cgns.py` | 核心重写：方言自检 + first-use 重排 + 带符号 NFACE_n + 完整 FLDUTIL CGNS writer |
+| `gph_model.py` | `LS_Nodes` 解析改为双方言自动判别（保留 word-reversed 兼容） |
+| `gph_parser.py` | 同步双方言支持；输出新增 `LS_Nodes_dialect` 字段 |
+| `gphviewer.py` | 顶点数据类型由 `R4[n,3]` 改为 `R8[n,3]`；禁用历史上不正确的逐 cell 顶点编辑 |
+| `GPH_FORMAT_SPEC.md` | 增加方言 A/B 对比与 `LS_Links` 详细块布局 |
+| `DEV_SUMMARY.md` | 本节（第三阶段）

@@ -173,18 +173,21 @@ def parse_gph(filepath: str) -> dict:
             result["data_arrays"]["LS_CvolIdOfElements_sample"] = arr
             result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
 
-    # LS_Nodes: vertex coordinates stored as three separate float64 axis blocks
-    # Each block: [16B descriptor: 12/8/n/1] + [12B header: 12/bytes/upper_max]
-    #             + [n × 8B word-reversed float64]
-    # Word-reversed means each float64 is stored as [lower_32bit_BE][upper_32bit_BE].
-    # e.g. 0.01 = 0x3F847AE147AE147B is stored as bytes 47 AE 14 7B 3F 84 7A E1.
+    # LS_Nodes: vertex coordinates stored as three separate float64 axis blocks.
+    # All observed GPH files use a single on-disk encoding:
+    #
+    #   [16B descriptor: 12 / 8 / n_verts / 1]
+    #   [8B  data header: 12 / byte_count]
+    #   [n_verts × 8B] standard big-endian IEEE-754 float64
+    #   [4B trailer: byte_count]
+    #
+    # axis order in the file is X, Y, Z.  A word-reversed reading with a
+    # 12-byte data header is kept as defensive fallback for hypothetical
+    # mid-endian GPH variants — none has been observed in practice.
     nodes_label = b"LS_Nodes" + b" " * 24
     nodes_idx = data.find(nodes_label)
     if nodes_idx >= 4:
-        pos = nodes_idx + 32 + 4 + 4  # skip name(32) + second marker(4) + first desc(4 already counted)
-        # Actually skip past label header: 4(marker)+32(name)+4(marker) = 40B from section start
-        pos = nodes_idx - 4 + 40  # section_start + 40
-        # Scan to find first [12, 8, n, 1] descriptor
+        pos = nodes_idx - 4 + 40  # skip [I4=32][32B name][I4=32]
         n_nodes = 0
         while pos + 16 <= len(data):
             if int.from_bytes(data[pos:pos+4], "big") != 12:
@@ -197,28 +200,67 @@ def parse_gph(filepath: str) -> dict:
                 n_nodes = d0
                 break
         if n_nodes > 0:
-            sample = []
-            axis_vals = []
-            for axis in range(min(3, 3)):
-                if pos + 12 > len(data):
-                    break
-                pos += 12  # skip 12B header
-                vals = []
-                for i in range(n_nodes):
-                    if pos + 8 > len(data):
+            def _read_axes(data_header_size: int, reader):
+                p = pos
+                axes = []
+                for _ in range(3):
+                    if p + data_header_size > len(data):
                         break
-                    lower = int.from_bytes(data[pos:pos+4], "big")
-                    upper = int.from_bytes(data[pos+4:pos+8], "big")
-                    vals.append(struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, "big"))[0])
-                    pos += 8
-                axis_vals.append(vals)
-                if pos + 16 <= len(data) and int.from_bytes(data[pos:pos+4], "big") == 12:
-                    pos += 16
+                    p += data_header_size
+                    vals = []
+                    for _ in range(n_nodes):
+                        if p + 8 > len(data):
+                            break
+                        vals.append(reader(p))
+                        p += 8
+                    axes.append(vals)
+                    if data_header_size == 8 and p + 4 <= len(data):
+                        p += 4
+                    if p + 16 <= len(data) and int.from_bytes(data[p:p+4], "big") == 12:
+                        p += 16
+                return axes
+
+            def _r_be(p):
+                return struct.unpack(">d", data[p:p+8])[0]
+
+            def _r_wr(p):
+                lower = int.from_bytes(data[p:p+4], "big")
+                upper = int.from_bytes(data[p+4:p+8], "big")
+                return struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, "big"))[0]
+
+            def _looks_like_coords(values):
+                import math
+                if not values:
+                    return False
+                for v in values:
+                    if not math.isfinite(v):
+                        return False
+                    a = abs(v)
+                    if a != 0.0 and (a > 1e6 or a < 1e-30):
+                        return False
+                return True
+
+            axes_new = _read_axes(8, _r_be)
+            axes_old = _read_axes(12, _r_wr)
+            if len(axes_new) == 3 and all(_looks_like_coords(a) for a in axes_new):
+                axis_vals, dialect = axes_new, "standard BE float64 (8B header)"
+                col_perm = (0, 1, 2)  # file order X, Y, Z
+            elif len(axes_old) == 3:
+                axis_vals, dialect = axes_old, "word-reversed float64 (12B header, fallback)"
+                col_perm = (0, 2, 1)  # file order X, Z, Y → output X, Y, Z
+            else:
+                axis_vals, dialect, col_perm = [], None, None
             if len(axis_vals) == 3:
+                sample = []
                 for i in range(min(3, n_nodes)):
-                    sample.append((axis_vals[0][i], axis_vals[2][i], axis_vals[1][i]))
+                    sample.append(
+                        (axis_vals[col_perm[0]][i],
+                         axis_vals[col_perm[1]][i],
+                         axis_vals[col_perm[2]][i]),
+                    )
                 result["data_arrays"]["LS_Nodes_sample"] = sample
                 result["data_arrays"]["LS_Nodes_count"] = n_nodes
+                result["data_arrays"]["LS_Nodes_dialect"] = dialect
 
     return result
 
@@ -298,17 +340,29 @@ def format_description() -> str:
   Element_InformationFlag : flags per element
 
   LS_Nodes detail:
-    Each spatial axis (X, Z, Y in file order) is stored as one block:
+    Each spatial axis is stored as one block.  All observed GPH files use a
+    single on-disk encoding:
       [16B descriptor: I4=12 / I4=8 / I4=n_verts / I4=1]
-      [12B header:     I4=12 / I4=byte_count / I4=upper_half_of_max_coord]
-      [n_verts × 8B]  one word-reversed float64 per vertex
+      [8B header:      I4=12 / I4=byte_count]
+      [n_verts × 8B]   standard big-endian IEEE-754 float64
+      [4B trailer:     I4=byte_count]
+    Axis order in the file: X, Y, Z.
 
-    Word-reversed float64: each 8-byte double is stored as
-      [lower_32bit_word_BE][upper_32bit_word_BE]
-    Example: 0.01 (= 0x3F847AE147AE147B) is stored as bytes
-      47 AE 14 7B  3F 84 7A E1
-    When mis-read as two float32 values this yields (89128.96, 1.035),
-    which is the root cause of the "89000+" coordinate bug.
+    Examples:
+      Legacy box.gph     : 0.01 = 0x3F847AE147AE147B, stored as
+                           3F 84 7A E1 47 AE 14 7B (plain big-endian).
+      ANSA box_ansa.gph  : float32(0.01) widened to float64
+                           = 0x3F847AE140000000, stored as
+                           3F 84 7A E1 40 00 00 00.
+
+    Historical note: the original parser skipped 12 bytes instead of 8 for
+    the data header and used a "word-reversed" reading.  For specific byte
+    patterns those two mistakes cancelled out on a handful of vertices,
+    which led to the misdiagnosis that the encoding was mid-endian.  Most
+    vertices, however, would have come out at ~1e37 magnitude — the
+    correct reading is straightforward big-endian float64 with an 8-byte
+    data header.  A word-reversed/12B-header fallback is still attempted
+    as defensive coverage for unknown variants.
 
 6. ALIGNMENT & PADDING
 ----------------------
