@@ -269,7 +269,7 @@ def _parse_ls_links(data: bytes):
     triples = [b for b in blocks if b[1] == n_faces_block_size][:3]
     owner_p, _ = triples[0]
     neigh_p, _ = triples[1]
-    # triples[2] is npe (nodes-per-face); we don't strictly need its values.
+    npe_p, _ = triples[2]
 
     BNDRY_U = 0xFFFFFFFF
     owner = np.frombuffer(data[owner_p : owner_p + n_faces_block_size],
@@ -279,31 +279,56 @@ def _parse_ls_links(data: bytes):
     neigh = neigh_raw.astype(np.int64)
     neigh[neigh_raw == BNDRY_U] = -1
 
-    # The connectivity block: largest remaining block whose byte_count is a
-    # multiple of 4 and ≥ 3 × n_faces × 4 (assuming at least triangular faces).
+    # ``npe`` (nodes-per-face) drives variable-length face connectivity for
+    # general polyhedral meshes.  For pure-triangle meshes every entry is 3
+    # (e.g. ``box_ansa.gph``), but tr03.gph mixes faces with 3 to 11 nodes.
+    npe = np.frombuffer(data[npe_p : npe_p + n_faces_block_size],
+                        dtype=">u4").astype(np.int64).copy()
+    conn_total_expected = int(npe.sum())
+
+    # The connectivity block: the one whose byte_count matches
+    # ``sum(npe) × 4`` exactly.  Falling back to the largest non-tri block
+    # remains useful for files where ``npe`` is uniform (== 3) and the conn
+    # block size = ``3 × n_faces × 4``.
     conn_block = None
     for p, bc in blocks:
         if (p, bc) in triples:
             continue
         if bc % 4 != 0:
             continue
-        if bc < 3 * n_faces * 4:
-            continue
-        if conn_block is None or bc > conn_block[1]:
+        if bc // 4 == conn_total_expected:
             conn_block = (p, bc)
+            break
+    if conn_block is None:
+        # Fall back: pick the largest remaining block (handles legacy files
+        # whose conn byte-count includes trailing sentinel padding).
+        for p, bc in blocks:
+            if (p, bc) in triples:
+                continue
+            if bc % 4 != 0:
+                continue
+            if bc < 3 * n_faces * 4:
+                continue
+            if conn_block is None or bc > conn_block[1]:
+                conn_block = (p, bc)
     if conn_block is None:
         return None
     conn_p, conn_bc = conn_block
     conn_total = conn_bc // 4
-    npe = conn_total // n_faces  # nodes per face (3 for triangular)
-    if npe < 3 or n_faces * npe != conn_total:
+    if conn_total < conn_total_expected:
         return None
 
-    conn = np.frombuffer(data[conn_p : conn_p + conn_bc], dtype=">u4").astype(np.int64).copy()
+    conn = np.frombuffer(data[conn_p : conn_p + conn_total_expected * 4],
+                         dtype=">u4").astype(np.int64).copy()
 
-    # The file stores face → node connectivity row-major: ``face_nodes[i, k]``
-    # is ``conn[i * npe + k]``.  Vertex indices are 0-based.
-    face_nodes = conn.reshape(n_faces, npe)
+    # ``face_nodes`` is now stored in *CSR-style* form: a flat 1-D array of
+    # 0-based vertex indices plus a length-``n_faces+1`` offset array.  Face
+    # ``i`` is ``conn[face_offsets[i] : face_offsets[i+1]]``.  This handles
+    # both pure-triangle meshes (npe ≡ 3) and arbitrary polyhedral meshes.
+    face_offsets = np.empty(n_faces + 1, dtype=np.int64)
+    face_offsets[0] = 0
+    np.cumsum(npe, out=face_offsets[1:])
+    face_nodes = conn  # flat 0-based vertex indices
 
     # ── Build cell ↔ face mappings.  In CGNS NFACE_n, faces owned by a cell
     # carry a positive index while faces for which the cell is the neighbour
@@ -323,8 +348,9 @@ def _parse_ls_links(data: bytes):
 
     return {
         "n_faces": n_faces,
-        "npe": npe,
-        "face_nodes": face_nodes,
+        "npe": npe,                 # (n_faces,) int64 — nodes-per-face
+        "face_nodes": face_nodes,   # flat (sum_npe,) int64, 0-based vertex IDs
+        "face_offsets": face_offsets,  # (n_faces+1,) int64, cumulative-sum prefix
         "owner": owner,
         "neighbor": neigh,
         "boundary_faces": boundary_faces,
@@ -339,25 +365,32 @@ def _parse_ls_links(data: bytes):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _renumber_by_first_use(face_nodes: np.ndarray, n_vertices: int) -> np.ndarray:
+def _renumber_by_first_use(face_nodes_flat: np.ndarray, n_vertices: int) -> np.ndarray:
     """Return a permutation ``perm`` such that ``perm[old_gph_id] = new_id``
     where ``new_id`` is the 0-based first-use index of ``old_gph_id`` in the
-    row-major scan of ``face_nodes``.  Vertices that never appear in any face
-    are appended at the end in their original order so the permutation is a
-    bijection.
+    scan of the flat (CSR-style) face-node connectivity array.
+
+    Vertices that never appear in any face are appended at the end in their
+    original order so the permutation is a bijection.
     """
     perm = np.full(n_vertices, -1, dtype=np.int64)
     next_id = 0
-    flat = face_nodes.reshape(-1)
-    for v in flat:
-        v = int(v)
-        if 0 <= v < n_vertices and perm[v] == -1:
-            perm[v] = next_id
-            next_id += 1
-    for v in range(n_vertices):
-        if perm[v] == -1:
-            perm[v] = next_id
-            next_id += 1
+    # Vectorised first-pass: collect the index of the first occurrence of each
+    # vertex via numpy.unique with return_index=True.
+    flat = np.asarray(face_nodes_flat).reshape(-1)
+    flat_valid = flat[(flat >= 0) & (flat < n_vertices)]
+    if flat_valid.size:
+        # np.unique returns sorted unique values and the index of the first
+        # occurrence of each.  We re-sort by index to recover scan order.
+        uniq, first_idx = np.unique(flat_valid, return_index=True)
+        order = np.argsort(first_idx)
+        unique_in_scan_order = uniq[order]
+        perm[unique_in_scan_order] = np.arange(len(unique_in_scan_order),
+                                                dtype=np.int64)
+        next_id = len(unique_in_scan_order)
+    # Append any vertices that were never referenced by a face.
+    missing = np.where(perm == -1)[0]
+    perm[missing] = np.arange(next_id, next_id + missing.size, dtype=np.int64)
     return perm
 
 
@@ -390,7 +423,9 @@ def parse_gph_mesh(filepath: str) -> dict:
         return result
 
     # Clamp any garbage node indices that exceed the known vertex count
-    # (occasional byte-count sentinel leakage seen on legacy files).
+    # (occasional byte-count sentinel leakage seen on legacy files).  The
+    # face-node array is now stored as a flat 1-D vector (CSR-style); index
+    # bound-checking is applied directly to it.
     fn = link_data["face_nodes"]
     bad = fn >= n_vertices
     if bad.any():
@@ -402,8 +437,7 @@ def parse_gph_mesh(filepath: str) -> dict:
     perm = _renumber_by_first_use(link_data["face_nodes"], n_vertices)
     inv_perm = np.argsort(perm)
     xyz_renum = xyz[inv_perm]
-    face_nodes_renum = perm[link_data["face_nodes"]]
-    link_data["face_nodes"] = face_nodes_renum
+    link_data["face_nodes"] = perm[link_data["face_nodes"]]
 
     result["vertices"] = xyz_renum
     result["n_vertices"] = n_vertices
@@ -498,20 +532,30 @@ def _write_grid_coordinates(zone, vertices: np.ndarray) -> None:
                                                               dtype=np.float64))
 
 
-def _write_ngon(zone, face_nodes_1based: np.ndarray, elem_range) -> None:
-    n_faces, npf = face_nodes_1based.shape
+def _write_ngon(zone, face_nodes_1based_flat: np.ndarray,
+                 face_offsets: np.ndarray, n_faces: int, elem_range) -> None:
+    """Write CGNS NGON_n element section using CSR-style face connectivity.
+
+    ``face_nodes_1based_flat``: flat 1-D int array of 1-based vertex IDs
+    concatenated across all faces (length = sum of face_nodes-per-face).
+    ``face_offsets``: length ``n_faces + 1`` cumulative-sum prefix
+    ``[0, n0, n0+n1, ...]`` indexing into ``face_nodes_1based_flat``.
+
+    This single code path handles both pure-triangle meshes (every face
+    contributes 3 entries) and arbitrary polyhedral meshes (faces with
+    varying node counts, e.g. tr03.gph has faces with 3..11 nodes).
+    """
     el = _cgns_node(zone, "GridElements_Faces", "Elements_t", "I4")
     _i32_dataset(el, " data", [22, n_faces])
 
     er = _cgns_node(el, "ElementRange", "IndexRange_t", "I4")
     _i32_dataset(er, " data", elem_range)
 
-    offsets = np.arange(0, (n_faces + 1) * npf, npf, dtype=np.int32)
     eso = _cgns_node(el, "ElementStartOffset", "DataArray_t", "I4")
-    _i32_dataset(eso, " data", offsets)
+    _i32_dataset(eso, " data", face_offsets)
 
     ec = _cgns_node(el, "ElementConnectivity", "DataArray_t", "I4")
-    _i32_dataset(ec, " data", face_nodes_1based.flatten())
+    _i32_dataset(ec, " data", face_nodes_1based_flat)
 
 
 def _build_nface_connectivity(link_data: dict):
@@ -591,8 +635,10 @@ def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict) -> 
 
     _write_grid_coordinates(zone, vertices)
 
-    face_nodes_1 = (link_data["face_nodes"] + 1).astype(np.int32)
-    _write_ngon(zone, face_nodes_1, elem_range=[1, n_faces])
+    face_nodes_1_flat = (link_data["face_nodes"] + 1).astype(np.int32)
+    face_offsets_i4 = link_data["face_offsets"].astype(np.int32)
+    _write_ngon(zone, face_nodes_1_flat, face_offsets_i4, n_faces,
+                elem_range=[1, n_faces])
     _write_nface(zone, zone_name, link_data,
                  elem_range=[n_faces + 1, n_faces + n_cells])
 
@@ -692,7 +738,14 @@ def main():
     print(f"  Vertices : {mesh['n_vertices']}")
     ld = mesh.get("link_data")
     if ld:
-        print(f"  Faces    : {ld['n_faces']}  (triangular, NGON_n)")
+        npe_arr = ld.get("npe")
+        if npe_arr is not None and len(npe_arr) > 0:
+            mn, mx = int(npe_arr.min()), int(npe_arr.max())
+            face_kind = ("triangular" if mn == mx == 3
+                         else f"polyhedral, {mn}..{mx} nodes per face")
+        else:
+            face_kind = "mixed"
+        print(f"  Faces    : {ld['n_faces']}  ({face_kind}, NGON_n)")
         print(f"  Cells    : {ld['n_cells']}  (NFACE_n)")
         print(f"  BC faces : {len(ld['boundary_faces'])}")
     else:
