@@ -1182,12 +1182,6 @@ def write_cgns(mesh: dict, outpath: str,
         # For the FluidRegion / full-mesh path, the GPH face IDs equal the
         # zone-local CGNS face IDs (modulo the 0/1-based shift), so the
         # identity map is the natural choice.
-        full_gph_to_local = np.concatenate([[0],
-                                             np.arange(1, n_faces_full + 1,
-                                                       dtype=np.int64)])
-        # ``gph_face_0based → gph_to_local_1based[gph_face_0based]`` would
-        # give a 0-prefixed lookup; we instead use it as a direct index by
-        # storing ``local = gph + 1`` at position ``gph``.  Easier:
         full_gph_to_local = np.arange(1, n_faces_full + 1, dtype=np.int64)
 
         for zname, cell_mask in zone_plan:
