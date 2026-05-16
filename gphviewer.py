@@ -298,7 +298,7 @@ class GphViewerMain(QMainWindow):
             self.edit_input.setEnabled(True)
             self.edit_input.setText(str(node.value))
             self.apply_btn.setEnabled(True)
-        elif node.data_type in ("I4[135]", "R4[n,3]", "I4[]") and node.value:
+        elif node.data_type in ("I4[135]", "I4[]", "R8[n,3]", "R8[]") and node.value:
             self.edit_input.setEnabled(True)
             self.edit_input.setPlaceholderText("Use Data tab; edit not yet implemented for arrays")
             self.edit_input.clear()
@@ -309,28 +309,19 @@ class GphViewerMain(QMainWindow):
             self.apply_btn.setEnabled(False)
 
     def on_table_cell_changed(self, item: QTableWidgetItem):
+        # Editing LS_Nodes vertex coordinates from the table is intentionally
+        # disabled.  Coordinates are stored in axis-major float64 blocks (X all
+        # together, then Y, then Z) with dialect-dependent encoding (standard
+        # big-endian for ANSA / word-reversed for legacy SCTpre) — patching a
+        # single cell would require recomputing the per-block byte_count
+        # sentinels and choosing the correct encoding for the file at hand,
+        # neither of which is implemented in the viewer.
         if self._table_loading or not self.current_node:
             return
-        node = self.current_node
-        if node.data_type != "R4[n,3]" or not isinstance(node.value, (list, tuple)):
-            return
-        row, col = item.row(), item.column()
-        if row >= len(node.value) or col >= 3:
-            return
-        try:
-            val = float(item.text())
-        except ValueError:
-            return
-        # LS_Nodes: data at 0x2750, vertex i has x,y,z at i*12, i*12+4, i*12+8
-        file_offset = 0x2750 + row * 12 + col * 4
-        import struct
-        new_raw = struct.pack(">f", val)
-        self.doc.apply_patch(file_offset, new_raw)
-        old_row = list(node.value[row])
-        old_row[col] = val
-        node.value[row] = tuple(old_row)
-        node.modified = True
-        self.statusBar().showMessage(f"Modified {node.name}[{row},{col}] = {val} (unsaved)")
+        # No-op: keep the table read-only for vertex arrays.
+        self.statusBar().showMessage(
+            "Vertex editing is disabled in the viewer (see DEV_SUMMARY.md)."
+        )
 
     def on_apply_edit(self):
         node = self.current_node

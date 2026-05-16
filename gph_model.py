@@ -16,12 +16,35 @@ def read_f32_be(data: bytes, pos: int) -> float:
     return struct.unpack(">f", data[pos : pos + 4])[0]
 
 
+def read_f64_be(data: bytes, pos: int) -> float:
+    """Read a standard big-endian IEEE-754 float64."""
+    return struct.unpack(">d", data[pos : pos + 8])[0]
+
+
 def read_f64_wr(data: bytes, pos: int) -> float:
     """Read float64 stored as word-reversed: [lower_32bit_BE][upper_32bit_BE]."""
     lower = int.from_bytes(data[pos : pos + 4], "big")
     upper = int.from_bytes(data[pos + 4 : pos + 8], "big")
     combined = ((upper << 32) | lower).to_bytes(8, "big")
     return struct.unpack(">d", combined)[0]
+
+
+def _looks_like_coords(values: list) -> bool:
+    """Heuristic: do the magnitudes look like physical CFD coordinates?
+
+    Used to auto-detect the GPH dialect (standard big-endian float64 vs the
+    legacy word-reversed encoding).
+    """
+    if not values:
+        return False
+    import math
+    for v in values:
+        if not math.isfinite(v):
+            return False
+        a = abs(v)
+        if a != 0.0 and (a > 1e6 or a < 1e-30):
+            return False
+    return True
 
 
 @dataclass
@@ -142,9 +165,16 @@ class GphDocument:
             return GphNode(name, offset, len(raw), "I4[]", value=None, raw=raw, children=[])
 
         if name == "LS_Nodes":
-            # Coordinates stored as three word-reversed float64 axis blocks.
-            # Each block: [16B descriptor: 12/8/n/1] + [12B header] + [n×8B data].
-            # Scan for the first [12, 8, n, 1] descriptor to locate n_vertices.
+            # Coordinates are stored as three float64 axis blocks.  Two on-disk
+            # dialects are supported (auto-detected at parse time):
+            #
+            #   Legacy SCTpre  – word-reversed float64,  12-byte data header,
+            #                    axis order X, Z, Y.
+            #   New ANSA/scFLOW – standard big-endian float64, 8-byte data
+            #                    header, axis order X, Y, Z.
+            #
+            # Each block is preceded by a 16-byte descriptor [12, 8, n, 1] and
+            # terminated by a 4-byte trailing length sentinel.
             pos = 40  # skip 40B label-header
             n_vertices = 0
             while pos + 16 <= len(raw):
@@ -157,27 +187,52 @@ class GphDocument:
                 if tc == 8 and d1 == 1 and d0 > 0:
                     n_vertices = d0
                     break
-            if n_vertices > 0:
-                axis_vals: list[list[float]] = []
+
+            def _read_axis_blocks(data_header_size: int, reader) -> list[list[float]]:
+                """Return [X_vals, ?, ?] for the three coordinate blocks."""
+                p = pos
+                axes: list[list[float]] = []
                 for _ in range(3):
-                    if pos + 12 > len(raw):
+                    if p + data_header_size > len(raw):
                         break
-                    pos += 12  # skip 12B data header
-                    vals: list[float] = []
+                    p += data_header_size
+                    vals = []
                     for _ in range(n_vertices):
-                        if pos + 8 > len(raw):
+                        if p + 8 > len(raw):
                             break
-                        vals.append(read_f64_wr(raw, pos))
-                        pos += 8
-                    axis_vals.append(vals)
-                    if pos + 16 <= len(raw) and read_i32_be(raw, pos) == 12:
-                        pos += 16
+                        vals.append(reader(raw, p))
+                        p += 8
+                    axes.append(vals)
+                    # Skip the 4-byte trailing sentinel (8-byte-header dialect)
+                    # or the 16-byte inter-block descriptor (12-byte-header dialect).
+                    if data_header_size == 8 and p + 4 <= len(raw):
+                        p += 4
+                    if p + 16 <= len(raw) and read_i32_be(raw, p) == 12:
+                        p += 16
+                return axes
+
+            if n_vertices > 0:
+                # Try the modern 8-byte-header / standard BE float64 dialect first.
+                axes_new = _read_axis_blocks(8, read_f64_be)
+                axes_old = _read_axis_blocks(12, read_f64_wr)
+                if (len(axes_new) == 3
+                        and all(_looks_like_coords(a) for a in axes_new)):
+                    # ANSA dialect: file order X, Y, Z.
+                    axis_vals, swap_zy = axes_new, False
+                else:
+                    # Legacy SCTpre dialect: file order X, Z, Y → swap.
+                    axis_vals, swap_zy = axes_old, True
                 if len(axis_vals) == 3:
-                    # file order: X, Z, Y → rearrange to X, Y, Z
-                    verts = [
-                        (axis_vals[0][i], axis_vals[2][i], axis_vals[1][i])
-                        for i in range(n_vertices)
-                    ]
+                    if swap_zy:
+                        verts = [
+                            (axis_vals[0][i], axis_vals[2][i], axis_vals[1][i])
+                            for i in range(n_vertices)
+                        ]
+                    else:
+                        verts = [
+                            (axis_vals[0][i], axis_vals[1][i], axis_vals[2][i])
+                            for i in range(n_vertices)
+                        ]
                     return GphNode(
                         name, offset, len(raw), "R8[n,3]",
                         value=verts, raw=raw, children=[],
