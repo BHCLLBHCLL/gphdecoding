@@ -408,6 +408,59 @@ def _parse_ls_string_section(data: bytes, section_name: str) -> list[str]:
     return out
 
 
+def _parse_ls_surface_regions(data: bytes) -> list[tuple[str, np.ndarray]]:
+    """Parse ``LS_SurfaceRegions`` into a list of ``(name, gph_face_ids)``.
+
+    Each surface region in the GPH file consists of three consecutive data
+    blocks: ``name`` (ASCII, NUL/space-padded), ``face_ids`` (I4 array, one
+    entry per face in the region) and ``weights`` (I4 array of the same
+    length, currently always 1).  The returned face IDs are **0-based**
+    indices into the global ``LS_Links`` face array — i.e. the natural
+    indexing used internally by scFLOW / FLDUTIL.
+
+    These regions become CGNS ``BC_t`` family groups under each zone's
+    ``ZoneBC`` (one BC per region; faces filtered against the zone's
+    sub-mesh).  For ``tr03.gph`` this yields 15 BCs per zone:
+
+      inlet, outlet, Rotate_Plane, Rotate_Cylinder, Rotate_Plane[2],
+      @PartSurface_Case, @PartSurface_Rotate, @PartSurface_Impeller,
+      Rotate_MovingFaceRegion,
+      Rotate_Plane_Moving, Rotate_Plane_Static,
+      Rotate_Cylinder_Moving, Rotate_Cylinder_Static,
+      Rotate_Plane[2]_Moving, Rotate_Plane[2]_Static
+    """
+    sec_start = _find_section(data, "LS_SurfaceRegions")
+    if sec_start < 0:
+        return []
+    sec_end = _section_end(data, sec_start)
+    blocks = list(_iter_data_blocks(data, sec_start, sec_end))
+
+    regions: list[tuple[str, np.ndarray]] = []
+    i = 0
+    while i + 2 < len(blocks):
+        p_n, bc_n = blocks[i]
+        p_i, bc_i = blocks[i + 1]
+        p_w, bc_w = blocks[i + 2]
+        name_raw = data[p_n : p_n + bc_n]
+        # Region name block: NUL/space-padded ASCII.
+        if not all(b == 0 or 32 <= b < 127 for b in name_raw):
+            i += 1
+            continue
+        name = name_raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+        if not name:
+            i += 1
+            continue
+        # Face-IDs block and weights block must have the same shape.
+        if bc_i > 0 and bc_i == bc_w and bc_i % 4 == 0:
+            face_ids = np.frombuffer(data[p_i : p_i + bc_i],
+                                     dtype=">i4").astype(np.int64).copy()
+            regions.append((name, face_ids))
+            i += 3
+        else:
+            i += 1
+    return regions
+
+
 def _parse_ls_assemblies(data: bytes) -> dict[str, Optional[str]]:
     """Parse ``LS_Assemblies`` XML → mapping ``part_name → assembly_name``.
 
@@ -558,6 +611,7 @@ def parse_gph_mesh(filepath: str) -> dict:
         "volume_regions": [],
         "parts": [],
         "part_assembly": {},
+        "surface_regions": [],
     }
 
     xyz, n_vertices = _parse_ls_nodes(data)
@@ -568,6 +622,7 @@ def parse_gph_mesh(filepath: str) -> dict:
     result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
     result["parts"] = _parse_ls_string_section(data, "LS_Parts")
     result["part_assembly"] = _parse_ls_assemblies(data)
+    result["surface_regions"] = _parse_ls_surface_regions(data)
 
     if xyz is None or n_vertices == 0 or link_data is None:
         return result
@@ -836,6 +891,13 @@ def _extract_zone_submesh(vertices: np.ndarray, link_data: dict,
 
     boundary_faces = list(np.where(new_neigh == -1)[0])
 
+    # GPH-face-id → local-face-id (1-based) map.  ``-1`` means the GPH face
+    # is not present in this sub-mesh.  Surface-region BC writers use this
+    # to remap LS_SurfaceRegions face IDs to per-zone CGNS face IDs.
+    gph_to_local_1based = np.full(n_faces_full, 0, dtype=np.int64)
+    gph_to_local_1based[kept_face_ids] = np.arange(1, n_faces_sub + 1,
+                                                    dtype=np.int64)
+
     sub_link = {
         "n_faces": n_faces_sub,
         "npe": sub_npe,
@@ -847,6 +909,7 @@ def _extract_zone_submesh(vertices: np.ndarray, link_data: dict,
         "cell_owner_faces": cell_owner_faces,
         "cell_neighbor_faces": cell_neighbor_faces,
         "n_cells": n_cells_sub,
+        "gph_to_local_face_1based": gph_to_local_1based,
     }
     return {"vertices": sub_vertices, "link_data": sub_link}
 
@@ -895,17 +958,33 @@ def _write_nface(zone, zone_name: str, link_data: dict, elem_range) -> None:
     _i32_dataset(ec, " data", conn)
 
 
-def _write_zone_bc(zone, boundary_face_ids_1based: np.ndarray,
-                    bc_name: str = "box_surfs") -> None:
+def _write_zone_bc(zone, bc_families: list[tuple[str, np.ndarray]]) -> None:
+    """Write the ``ZoneBC_t`` node with one ``BC_t`` family per entry of
+    *bc_families*.
+
+    Each family is a ``(name, face_ids_1based_int32)`` pair.  Empty face
+    lists are still emitted as a BC group (shape ``(0,)`` PointList) so
+    every zone has the same set of named families — this matches the
+    layout of ``tr03_orig.cgns`` where e.g. ``inlet`` appears in every
+    zone, but its PointList is empty in sub-mesh zones that don't include
+    the inlet boundary.
+    """
     zbc = _cgns_node(zone, "ZoneBC", "ZoneBC_t", "MT")
-    bc = _cgns_node(zbc, bc_name, "BC_t", "C1")
-    _bytes_dataset(bc, " data", b"Null")
+    for bc_name, face_ids in bc_families:
+        bc = _cgns_node(zbc, bc_name, "BC_t", "C1")
+        _bytes_dataset(bc, " data", b"Null")
 
-    gl = _cgns_node(bc, "GridLocation", "GridLocation_t", "C1")
-    _bytes_dataset(gl, " data", b"FaceCenter")
+        gl = _cgns_node(bc, "GridLocation", "GridLocation_t", "C1")
+        _bytes_dataset(gl, " data", b"FaceCenter")
 
-    pl = _cgns_node(bc, "PointList", "IndexArray_t", "I4")
-    _i32_dataset(pl, " data", boundary_face_ids_1based)
+        pl = _cgns_node(bc, "PointList", "IndexArray_t", "I4")
+        # When the zone contains *no* faces from this BC region the vendor
+        # exporter creates the PointList group with the standard CGNS
+        # attributes but *omits* the ' data' dataset entirely.  Match that
+        # so e.g. the reference's empty ``inlet`` in Rotate_MovingVolumeRegion
+        # is byte-equivalent to our output.
+        if face_ids.size > 0:
+            _i32_dataset(pl, " data", face_ids)
 
 
 def _write_flow_solution(zone) -> None:
@@ -914,7 +993,8 @@ def _write_flow_solution(zone) -> None:
     _bytes_dataset(gl, " data", b"CellCenter")
 
 
-def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict) -> None:
+def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict,
+                 bc_families: Optional[list[tuple[str, np.ndarray]]] = None) -> None:
     n_vertex = int(vertices.shape[0])
     n_faces = int(link_data["n_faces"])
     n_cells = int(link_data["n_cells"])
@@ -935,10 +1015,45 @@ def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict) -> 
     _write_nface(zone, zone_name, link_data,
                  elem_range=[n_faces + 1, n_faces + n_cells])
 
-    boundary_1 = np.asarray(link_data["boundary_faces"], dtype=np.int32) + 1
-    _write_zone_bc(zone, boundary_1)
+    if bc_families is None:
+        # Legacy single-BC layout used when no LS_SurfaceRegions are
+        # available (e.g. synthetic test files): emit one BC family named
+        # ``box_surfs`` listing every boundary face of the zone.
+        boundary_1 = np.asarray(link_data["boundary_faces"],
+                                 dtype=np.int32) + 1
+        bc_families = [("box_surfs", boundary_1)]
+    _write_zone_bc(zone, bc_families)
 
     _write_flow_solution(zone)
+
+
+def _bc_families_for_zone(
+    surface_regions: list[tuple[str, np.ndarray]],
+    gph_to_local_1based: np.ndarray,
+) -> list[tuple[str, np.ndarray]]:
+    """Project the global GPH ``LS_SurfaceRegions`` definitions onto a single
+    CGNS zone using *gph_to_local_1based* (length n_faces_full, value 0 for
+    GPH faces absent from the zone, otherwise the zone-local 1-based face
+    ID).
+
+    Returns the list of ``(region_name, face_ids_1based_int32)`` pairs to
+    hand to :func:`_write_zone_bc`.  Regions with no faces present in the
+    zone are still emitted (with an empty PointList) so the BC structure
+    is uniform across all zones — this matches the layout that the
+    vendor's FLDUTIL exporter produces in ``tr03_orig.cgns``.
+    """
+    out: list[tuple[str, np.ndarray]] = []
+    for name, gph_face_ids in surface_regions:
+        # gph_face_ids are 0-based global GPH indices.  Look up each in the
+        # zone-local-id table; entries equal to 0 mean "face not present in
+        # this zone" and are filtered out.
+        if gph_face_ids.size:
+            local = gph_to_local_1based[gph_face_ids]
+            local = local[local > 0].astype(np.int32)
+        else:
+            local = np.empty(0, dtype=np.int32)
+        out.append((name, local))
+    return out
 
 
 def _build_zone_plan(mesh: dict,
@@ -1061,13 +1176,30 @@ def write_cgns(mesh: dict, outpath: str,
         rsd = _cgns_node(rs, "ReferenceStateDescription", "Descriptor_t", "C1")
         _bytes_dataset(rsd, " data", b"Software Cradle FLDUTIL")
 
+        surface_regions = mesh.get("surface_regions", [])
+        n_faces_full = int(link_data["n_faces"])
+
+        # For the FluidRegion / full-mesh path, the GPH face IDs equal the
+        # zone-local CGNS face IDs (modulo the 0/1-based shift), so the
+        # identity map is the natural choice.
+        full_gph_to_local = np.arange(1, n_faces_full + 1, dtype=np.int64)
+
         for zname, cell_mask in zone_plan:
             if cell_mask.all():
                 # Whole-mesh zone — no sub-mesh extraction needed.
-                _write_zone(base, zname, vertices, link_data)
+                bc_families = (_bc_families_for_zone(surface_regions,
+                                                      full_gph_to_local)
+                               if surface_regions else None)
+                _write_zone(base, zname, vertices, link_data,
+                            bc_families=bc_families)
             else:
                 sub = _extract_zone_submesh(vertices, link_data, cell_mask)
-                _write_zone(base, zname, sub["vertices"], sub["link_data"])
+                gph_to_local = sub["link_data"]["gph_to_local_face_1based"]
+                bc_families = (_bc_families_for_zone(surface_regions,
+                                                      gph_to_local)
+                               if surface_regions else None)
+                _write_zone(base, zname, sub["vertices"], sub["link_data"],
+                            bc_families=bc_families)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
