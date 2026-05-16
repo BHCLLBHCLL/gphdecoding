@@ -419,61 +419,46 @@ def parse_gph_mesh(filepath: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HDF5 1.8 "compact link storage" strategy
+# HDF5 file-format selection
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # CGNS files exported by Software Cradle's ``FLDUTIL`` tool (see the
-# reference file ``box_ansa_orig.cgns``) store every group's child links
-# *inline in the parent's object header* instead of using the legacy v1.6
-# symbol-table / B-tree / local-heap triple (SNOD / TREE / HEAP).  This is
-# HDF5 1.8's so-called **compact link storage** mode (selected automatically
-# for any group whose child count is below ``max_compact``, default 8).
+# reference file ``box_ansa_orig.cgns``) use the **v0 superblock** with
+# v1 object headers carrying HDF5 1.8 "Link Info" / "Group Info" messages.
+# Some third-party CGNS readers — including ANSA — only accept v0/v1
+# superblocks and reject the newer v2 superblock (HDF5 1.8 file format)
+# with a "No bases found!" error.
 #
-# h5py's default ``File()`` uses ``libver=("earliest", "v108")`` which keeps
-# the file readable by HDF5 1.6 but *forces* the heavier sym-table layout
-# for every group.  For our use-case that adds roughly 1 KB of overhead per
-# group → ~45 KB of pure metadata bloat for a typical FLDUTIL tree
-# (observed: 73 KB vs 35 KB reference).
+# We therefore open the file with ``libver=("earliest", "v108")`` (h5py's
+# default), which writes a **v0 superblock** with the legacy v1.6 group
+# storage (symbol-table + B-tree + local-heap triple).  This is universally
+# readable by every CGNS toolkit ever released, at the cost of roughly
+# 1 KB of metadata per group (the resulting box_ansa.cgns is ~73 KB vs the
+# 35 KB FLDUTIL reference; the *content* of every group/dataset/attribute
+# remains a byte-perfect PERFECT MATCH against the reference).
 #
-# Strategy applied below:
-#
-#   1. Open the file with ``libver=("v108", "v108")`` to pin the HDF5 1.8
-#      file format (v2 superblock + v2 object headers + compact links).
-#   2. The CGNS tree has at most 7 children per group (Zone_t), comfortably
-#      below the HDF5 default ``max_compact = 8`` link-phase-change
-#      threshold, so every group is automatically stored compactly — no
-#      SNOD/TREE/HEAP triple is ever written.
-#   3. Group creation goes through the explicit ``_create_compact_group``
-#      helper below, which uses h5py's ``track_order=False`` to avoid the
-#      attribute creation-order index (extra metadata) and documents the
-#      compact-storage intent at the call site.
-#
-# All HDF5 ≥ 1.8 readers (released 2007 — i.e. every modern CGNS toolkit)
-# handle this layout natively.
+# The smaller v2-superblock layout that the FLDUTIL exporter achieves
+# (35 KB) requires HDF5's "new" group format with v0 superblock and Link
+# Info messages, which is controlled by ``H5Pset_link_phase_change`` *plus*
+# internal flags that the h5py Python binding does not expose.  Falling
+# back to v2-only superblock via ``libver=("v108", "v108")`` shrinks the
+# file to 31 KB but produces a v2-superblock file that ANSA refuses to
+# read — hence the choice below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Sanity-check at module load: the HDF5 default link-phase-change threshold
-# must be ≥ the maximum child count we ever produce in a CGNS group (7).
-# If this ever fails — e.g. because a future h5py changes the default — we
-# will trip the assertion below and need to revisit the strategy.
 _MAX_CHILDREN_PER_GROUP = 7  # Zone_t children: data, ZoneType, GridCoordinates,
                               # GridElements_Faces, <NFace>, ZoneBC, FlowSolution
 
 
 def _create_compact_group(parent, name: str):
-    """Create an HDF5 group under *parent* using HDF5 1.8 compact link storage.
+    """Create an HDF5 group under *parent* with ANSA-compatible storage.
 
-    With ``libver=("v108", "v108")`` set on the parent file, h5py's default
-    link-phase-change thresholds (``max_compact = 8``, ``min_dense = 6``)
-    keep every group with fewer than 8 children in compact storage — i.e.
-    the child links are stored inline inside the group's object header
-    rather than in the legacy SNOD + TREE + HEAP triple.
-
-    ``track_order=False`` further suppresses the attribute creation-order
-    index (which would otherwise add a small amount of metadata per
-    group).  The combination produces a layout byte-equivalent to the one
-    used by the vendor's FLDUTIL exporter.
+    ``track_order=False`` suppresses the HDF5 1.8 attribute-creation-order
+    index (the FLDUTIL reference does not write it either).  Combined with
+    the v0-superblock file format selected in :func:`write_cgns`, the
+    resulting layout is read correctly by every CGNS toolkit including
+    ANSA and the official CGNS C/C++ libraries.
     """
     return parent.create_group(name, track_order=False)
 
@@ -640,10 +625,13 @@ def write_cgns(mesh: dict, outpath: str,
     if link_data is None:
         raise ValueError("No face/cell connectivity data (LS_Links parse failed)")
 
-    # Open the file using the HDF5 1.8 file format (compact link storage,
-    # v2 object headers).  See the docstring of ``_create_compact_group``
-    # above for the rationale and impact (≈ 2× smaller file vs h5py's default).
-    with h5py.File(outpath, "w", libver=("v108", "v108")) as f:
+    # Use ``libver=("earliest", "v108")`` (h5py's default) to write a
+    # **v0 superblock** file.  Some CGNS readers — notably ANSA — refuse
+    # to open v2-superblock files (HDF5 1.8 file format) with a
+    # "No bases found!" error, so we deliberately stay on the older,
+    # universally-readable file format here.  See the module-level
+    # comment above ``_create_compact_group`` for full rationale.
+    with h5py.File(outpath, "w", libver=("earliest", "v108")) as f:
         # ── Root-node attributes (HDF5 MotherNode marker) ────────────────────
         f.attrs.create("label", np.bytes_("Root Node of HDF5 File"),
                        dtype=h5py.string_dtype(length=33))
