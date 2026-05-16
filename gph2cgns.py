@@ -576,7 +576,15 @@ def write_cgns(mesh: dict, outpath: str,
     if link_data is None:
         raise ValueError("No face/cell connectivity data (LS_Links parse failed)")
 
-    with h5py.File(outpath, "w") as f:
+    # ``libver=("v108", "v108")`` selects the HDF5 1.8 file format which
+    # stores child links directly in the object header (compact link storage)
+    # instead of the older symbol-table / B-tree / local-heap triple.  This
+    # matches the metadata layout used by the vendor's FLDUTIL exporter and
+    # keeps the resulting file in the same size ballpark as
+    # ``box_ansa_orig.cgns`` (otherwise h5py's default produces files roughly
+    # 2× larger due to per-group SNOD+TREE+HEAP overhead).  All modern CGNS
+    # readers (HDF5 ≥ 1.8, released 2007) handle this format natively.
+    with h5py.File(outpath, "w", libver=("v108", "v108")) as f:
         # ── Root-node attributes (HDF5 MotherNode marker) ────────────────────
         f.attrs.create("label", np.bytes_("Root Node of HDF5 File"),
                        dtype=h5py.string_dtype(length=33))
