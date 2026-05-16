@@ -97,37 +97,54 @@ class GphDocument:
         data = bytes(self._raw_data)
         root = GphNode("GPH File", 0, len(data), "raw", children=[])
 
-        # Known section layout from reverse engineering
-        sections = [
-            (0x0000, 0x001C, "file_header", "Header (CRDL-FLD + dims)"),
-            (0x001C, 0x0078, "FileRevision", "I4"),
-            (0x0078, 0x00D8, "Application", "C1[8]"),
-            (0x00D8, 0x0134, "ApplicationVersion", "I4"),
-            (0x0134, 0x0190, "ReleaseDate", "string"),
-            (0x0190, 0x01EC, "GridType", "string"),
-            (0x01EC, 0x0248, "Dimension", "I4"),
-            (0x0248, 0x02A4, "Bias", "I4"),
-            (0x02A4, 0x0300, "Date", "string"),
-            (0x0300, 0x03A8, "Comments", "string"),
-            (0x03A8, 0x04E0, "Cycle", "I4 + Unit"),
-            (0x04E0, 0x0560, "Unused", "reserved"),
-            (0x0560, 0x05D8, "Encoding", "string"),
-            (0x05D8, 0x0600, "HeaderDataEnd", "marker"),
-            (0x0600, 0x0628, "OverlapStart_0", "marker"),
-            (0x0628, 0x08DC, "LS_CvolIdOfElements", "I4[135]"),
-            (0x08DC, 0x26B0, "LS_Links", "I4[]"),
-            (0x26B0, 0x2C60, "LS_Nodes", "R8[n,3]"),
-            (0x2C60, 0x42B0, "LS_SurfaceRegions", "raw"),
-            (0x42B0, 0x45A4, "Element_InformationFlag", "raw"),
-            (0x45A4, len(data), "OverlapEnd", "trailer"),
+        # ── Dynamically locate every known named section ────────────────────
+        #
+        # Each named section is preceded by ``[I4=32]`` and contains a
+        # 32-byte ASCII (space-padded) label.  We scan for those labels to
+        # build a section layout that adapts to any file size (the legacy
+        # ``box.gph`` and the new ``box_ansa.gph`` differ by ~13 kB).
+        candidate_names = [
+            "FileRevision",
+            "Application",
+            "ApplicationVersion",
+            "ReleaseDate",
+            "GridType",
+            "Dimension",
+            "Bias",
+            "Date",
+            "Comments",
+            "Cycle",
+            "Unused",
+            "Encoding",
+            "HeaderDataEnd",
+            "OverlapStart_0",
+            "LS_CvolIdOfElements",
+            "LS_Links",
+            "LS_Nodes",
+            "LS_SurfaceRegions",
+            "Element_InformationFlag",
+            "OverlapEnd",
         ]
+        found = []  # list of (offset, name)
+        for name in candidate_names:
+            padded = name.ljust(32).encode("ascii")
+            idx = data.find(padded)
+            if idx >= 4 and read_i32_be(data, idx - 4) == 32:
+                found.append((idx - 4, name))
+        found.sort(key=lambda x: x[0])
+
+        # The fixed file-header sits before the first named section.
+        first_off = found[0][0] if found else len(data)
+        sections = [(0, first_off, "file_header", "Header (CRDL-FLD + dims)")]
+        for i, (off, name) in enumerate(found):
+            end = found[i + 1][0] if i + 1 < len(found) else len(data)
+            sections.append((off, end, name, ""))
 
         for start, end, name, desc in sections:
             raw = data[start:end]
             node = self._create_node(name, start, raw, desc)
             node.parent = root
             root.children.append(node)
-            root.size += 0
 
         return root
 
@@ -151,30 +168,29 @@ class GphDocument:
             return GphNode(name, offset, len(raw), "I4", value=v, raw=raw, children=[])
 
         if name == "LS_CvolIdOfElements":
-            # Data at ~0x69C, 135 x I4
-            data_start = 0x069C - offset
-            if data_start >= 0 and data_start + 540 <= len(raw):
-                arr = [
-                    read_i32_be(raw, data_start + i * 4)
-                    for i in range(min(135, (len(raw) - data_start) // 4))
-                ]
-                return GphNode(
-                    name, offset, len(raw), "I4[135]",
-                    value=arr, raw=raw, children=[],
-                )
-            return GphNode(name, offset, len(raw), "I4[]", value=None, raw=raw, children=[])
+            # Locate the [12, type=4, dim0=n_elements, dim1=1] descriptor by
+            # scanning forward from the label header; the data follows after a
+            # 12-byte block header (legacy) or 8-byte block header (modern).
+            arr = self._read_i4_array_after_label(raw)
+            type_str = f"I4[{len(arr)}]" if arr is not None else "I4[]"
+            return GphNode(name, offset, len(raw), type_str,
+                           value=arr, raw=raw, children=[])
 
         if name == "LS_Nodes":
-            # Coordinates are stored as three float64 axis blocks.  Two on-disk
-            # dialects are supported (auto-detected at parse time):
+            # Coordinates are stored as three float64 axis blocks.  All
+            # observed GPH files (legacy box.gph as well as the modern
+            # ANSA / scFLOW box_ansa.gph) use the same on-disk encoding:
             #
-            #   Legacy SCTpre  – word-reversed float64,  12-byte data header,
-            #                    axis order X, Z, Y.
-            #   New ANSA/scFLOW – standard big-endian float64, 8-byte data
-            #                    header, axis order X, Y, Z.
+            #   [16B descriptor: 12 / 8 / n_verts / 1]
+            #   [8B  data header: 12 / byte_count]
+            #   [n_verts × 8B] standard big-endian IEEE-754 float64
+            #   [4B trailer: byte_count]
             #
-            # Each block is preceded by a 16-byte descriptor [12, 8, n, 1] and
-            # terminated by a 4-byte trailing length sentinel.
+            # axis order in the file is X, Y, Z.  A word-reversed reading with
+            # a 12-byte data header is kept as defensive fallback for any
+            # hypothetical GPH variant that might use the legacy mid-endian
+            # encoding (none has been observed in practice — the historical
+            # "word-reversed" theory was an off-by-4 alignment artifact).
             pos = 40  # skip 40B label-header
             n_vertices = 0
             while pos + 16 <= len(raw):
@@ -240,14 +256,88 @@ class GphDocument:
             return GphNode(name, offset, len(raw), "R8[]", value=None, raw=raw, children=[])
 
         if name == "LS_Links":
-            data_start = 0x09C0 - offset
-            if data_start >= 0 and data_start < len(raw):
-                n = (len(raw) - data_start) // 4
-                arr = [read_i32_be(raw, data_start + i * 4) for i in range(min(n, 500))]
-                return GphNode(name, offset, len(raw), "I4[]", value=arr, raw=raw, children=[])
-            return GphNode(name, offset, len(raw), "I4[]", value=None, raw=raw, children=[])
+            # Concatenate every data block (owner / neighbor / npe / [face_type]
+            # / conn) by scanning the section with the same data-block pattern
+            # used by gph2cgns.  Returns a flat I4 array preview for the
+            # viewer's Data tab.
+            arr = self._collect_data_blocks_i4(raw)
+            type_str = f"I4[{len(arr)}]" if arr is not None else "I4[]"
+            return GphNode(name, offset, len(raw), type_str,
+                           value=arr, raw=raw, children=[])
 
         return GphNode(name, offset, len(raw), "raw", value=desc, raw=raw, children=[])
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_i4_array_after_label(raw: bytes) -> Optional[list[int]]:
+        """Return the first I4 array stored in a section.
+
+        Skips the 40-byte label header, any metadata descriptors of the form
+        ``[12, type, dim0, dim1]`` and the data-block header (8 or 12 bytes),
+        then reads ``byte_count // 4`` big-endian int32 values.
+        """
+        pos = 40
+        n = 0
+        # Find a descriptor [12, 4, n, 1] giving the array length.
+        while pos + 16 <= len(raw):
+            if read_i32_be(raw, pos) != 12:
+                break
+            tc = read_i32_be(raw, pos + 4)
+            d0 = read_i32_be(raw, pos + 8)
+            d1 = read_i32_be(raw, pos + 12)
+            pos += 16
+            if tc == 4 and d1 == 1 and d0 > 1:
+                n = d0
+                break
+        if n == 0:
+            return None
+        # Locate the next data header: [12, byte_count] (8 bytes) — its
+        # ``byte_count`` should equal ``n * 4``.
+        expected_bc = n * 4
+        # Tolerate up to ~16 bytes of additional padding/descriptor.
+        for shift in (0, 4, 8, 12, 16):
+            p = pos + shift
+            if p + 8 + expected_bc > len(raw):
+                continue
+            if read_i32_be(raw, p) == 12 and read_i32_be(raw, p + 4) == expected_bc:
+                p += 8
+                return [read_i32_be(raw, p + i * 4) for i in range(n)]
+        return None
+
+    @staticmethod
+    def _collect_data_blocks_i4(raw: bytes) -> Optional[list[int]]:
+        """Walk a section, concatenating every I4 payload (preview, capped)."""
+        pos = 40
+        out: list[int] = []
+        max_preview = 1000
+        while pos + 8 <= len(raw) and len(out) < max_preview:
+            if read_i32_be(raw, pos) != 12:
+                pos += 4
+                continue
+            v = read_i32_be(raw, pos + 4)
+            # Descriptor [12, type in (4,8), dim0, dim1]?
+            if v in (4, 8) and pos + 16 <= len(raw):
+                d0 = read_i32_be(raw, pos + 8)
+                d1 = read_i32_be(raw, pos + 12)
+                if 0 < d0 < 10_000_000 and 0 < d1 < 10_000_000:
+                    pos += 16
+                    continue
+            # Data header [12, byte_count]?
+            bc = v
+            if bc <= 0 or pos + 8 + bc + 4 > len(raw):
+                pos += 4
+                continue
+            payload_end = pos + 8 + bc
+            if read_i32_be(raw, payload_end) != bc:
+                pos += 4
+                continue
+            for i in range(bc // 4):
+                if len(out) >= max_preview:
+                    break
+                out.append(read_i32_be(raw, pos + 8 + i * 4))
+            pos = payload_end + 4
+        return out if out else None
 
     def apply_patch(self, offset: int, new_bytes: bytes) -> None:
         """Record a modification for save."""

@@ -174,14 +174,16 @@ def parse_gph(filepath: str) -> dict:
             result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
 
     # LS_Nodes: vertex coordinates stored as three separate float64 axis blocks.
-    # Two on-disk dialects exist (auto-detected at parse time):
+    # All observed GPH files use a single on-disk encoding:
     #
-    #   Legacy SCTpre  – word-reversed float64 (each 8B double stored as
-    #                    [lower_32bit_BE][upper_32bit_BE]); 12-byte data header
-    #                    per block; axis order X, Z, Y.
-    #   New ANSA/scFLOW – standard big-endian float64;  8-byte data header per
-    #                    block followed by a 4-byte trailing sentinel; axis
-    #                    order X, Y, Z.
+    #   [16B descriptor: 12 / 8 / n_verts / 1]
+    #   [8B  data header: 12 / byte_count]
+    #   [n_verts × 8B] standard big-endian IEEE-754 float64
+    #   [4B trailer: byte_count]
+    #
+    # axis order in the file is X, Y, Z.  A word-reversed reading with a
+    # 12-byte data header is kept as defensive fallback for hypothetical
+    # mid-endian GPH variants — none has been observed in practice.
     nodes_label = b"LS_Nodes" + b" " * 24
     nodes_idx = data.find(nodes_label)
     if nodes_idx >= 4:
@@ -241,10 +243,10 @@ def parse_gph(filepath: str) -> dict:
             axes_new = _read_axes(8, _r_be)
             axes_old = _read_axes(12, _r_wr)
             if len(axes_new) == 3 and all(_looks_like_coords(a) for a in axes_new):
-                axis_vals, dialect = axes_new, "BE float64 (ANSA)"
+                axis_vals, dialect = axes_new, "standard BE float64 (8B header)"
                 col_perm = (0, 1, 2)  # file order X, Y, Z
             elif len(axes_old) == 3:
-                axis_vals, dialect = axes_old, "word-reversed float64 (SCTpre)"
+                axis_vals, dialect = axes_old, "word-reversed float64 (12B header, fallback)"
                 col_perm = (0, 2, 1)  # file order X, Z, Y → output X, Y, Z
             else:
                 axis_vals, dialect, col_perm = [], None, None
@@ -338,29 +340,29 @@ def format_description() -> str:
   Element_InformationFlag : flags per element
 
   LS_Nodes detail:
-    Each spatial axis is stored as one block.  Two on-disk dialects exist
-    and are auto-detected based on the resulting coordinate magnitudes:
-
-    [Legacy SCTpre dialect] (word-reversed float64)
-      [16B descriptor: I4=12 / I4=8 / I4=n_verts / I4=1]
-      [12B header:     I4=12 / I4=byte_count / I4=upper_half_of_max_coord]
-      [n_verts × 8B]  one word-reversed float64 per vertex
-      Word-reversed: [lower_32bit_word_BE][upper_32bit_word_BE]
-      Axis order in the file: X, Z, Y.
-
-    [Modern ANSA / scFLOW dialect] (standard big-endian float64)
+    Each spatial axis is stored as one block.  All observed GPH files use a
+    single on-disk encoding:
       [16B descriptor: I4=12 / I4=8 / I4=n_verts / I4=1]
       [8B header:      I4=12 / I4=byte_count]
-      [n_verts × 8B]  one big-endian float64 per vertex
+      [n_verts × 8B]   standard big-endian IEEE-754 float64
       [4B trailer:     I4=byte_count]
-      Axis order in the file: X, Y, Z.
+    Axis order in the file: X, Y, Z.
 
-    Example (legacy): 0.01 = 0x3F847AE147AE147B stored as bytes
-      47 AE 14 7B  3F 84 7A E1
-    When mis-read as two float32 values this yields (89128.96, 1.035),
-    which was the root cause of the historical "89000+" coordinate bug.
-    Modern files store 0.01 as 0x3F847AE140000000 (float32(0.01) widened
-    to float64), i.e. bytes 3F 84 7A E1 40 00 00 00 in plain big-endian.
+    Examples:
+      Legacy box.gph     : 0.01 = 0x3F847AE147AE147B, stored as
+                           3F 84 7A E1 47 AE 14 7B (plain big-endian).
+      ANSA box_ansa.gph  : float32(0.01) widened to float64
+                           = 0x3F847AE140000000, stored as
+                           3F 84 7A E1 40 00 00 00.
+
+    Historical note: the original parser skipped 12 bytes instead of 8 for
+    the data header and used a "word-reversed" reading.  For specific byte
+    patterns those two mistakes cancelled out on a handful of vertices,
+    which led to the misdiagnosis that the encoding was mid-endian.  Most
+    vertices, however, would have come out at ~1e37 magnitude — the
+    correct reading is straightforward big-endian float64 with an 8-byte
+    data header.  A word-reversed/12B-header fallback is still attempted
+    as defensive coverage for unknown variants.
 
 6. ALIGNMENT & PADDING
 ----------------------
