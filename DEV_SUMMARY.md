@@ -10,6 +10,7 @@
 6. [改动文件清单](#6-改动文件清单)
 7. [经验总结](#7-经验总结)
 8. [第三阶段：ANSA 方言适配 + FLDUTIL 输出对齐](#8-第三阶段ansa-方言适配--fldutil-输出对齐)
+9. [第四阶段：HDF5 superblock 版本与 ANSA 兼容性](#9-第四阶段hdf5-superblock-版本与-ansa-兼容性)
 
 ---
 
@@ -485,4 +486,96 @@ PERFECT MATCH against box_ansa_orig.cgns
 | `gph_parser.py` | 同步双方言支持；输出新增 `LS_Nodes_dialect` 字段 |
 | `gphviewer.py` | 顶点数据类型由 `R4[n,3]` 改为 `R8[n,3]`；禁用历史上不正确的逐 cell 顶点编辑 |
 | `GPH_FORMAT_SPEC.md` | 增加方言 A/B 对比与 `LS_Links` 详细块布局 |
-| `DEV_SUMMARY.md` | 本节（第三阶段）
+| `DEV_SUMMARY.md` | 本节（第三阶段）|
+
+---
+
+## 9. 第四阶段：HDF5 superblock 版本与 ANSA 兼容性
+
+### 9.1 问题现象
+
+第三阶段完成后，曾尝试通过 `h5py.File(libver=("v108", "v108"))` 启用 HDF5 1.8 紧凑链接存储（compact link storage），把输出文件从 73 KB 缩到 31 KB（甚至比 35 KB 的官网参考更小），并通过逐字段比对验证 `PERFECT MATCH`。但用户用 **ANSA** 导入这个 31 KB 文件时，前置网格器报错：
+
+> **No bases found!**
+
+ANSA 拒绝识别文件中的 `CGNSBase_t` 节点，即使该节点结构上确实存在。
+
+### 9.2 根因：HDF5 superblock 版本不兼容
+
+HDF5 文件起始 8 字节是魔数 `\x89HDF\r\n\x1a\n`，紧接着第 9 字节（offset 8）就是 **superblock 版本号**。三个候选格式的字节级差异：
+
+| superblock 版本 | 触发条件 | object header | 组存储 | OHDR 签名 | SNOD/TREE/HEAP |
+|----------------|----------|---------------|-------|-----------|----------------|
+| **v0** | `libver_low='earliest'` | v1（无签名） | sym-table（v1.6） | 0 | 45 / 45 / 45 |
+| **v1** | 非默认 `sym_k` / `istore_k` | v1 | sym-table | 0 | 45+ |
+| **v2** | `libver_low='v108'+` | v2 OHDR | compact link / dense | 84 | 0 / 0 / 0 |
+
+逐字节确认三个文件：
+
+```
+box_ansa_orig.cgns (vendor)   : 35 448 B  superblock=0  OHDR=0   SNOD/TREE/HEAP=0/0/0  ← 特殊!
+我们 libver=v108 (31 KB)      : 31 260 B  superblock=2  OHDR=84  SNOD/TREE/HEAP=0/0/0  ← ANSA 拒绝
+我们 libver=default (73 KB)   : 73 360 B  superblock=0  OHDR=0   SNOD/TREE/HEAP=45/45/45 ← ANSA 可读
+```
+
+**ANSA 的 CGNS 读取器只接受 superblock v0 / v1**，遇到 v2 superblock 直接判定文件为空，抛出 "No bases found!"。
+
+### 9.3 vendor 的特殊布局（v0 + Link Info 消息）
+
+官网参考 `box_ansa_orig.cgns` 兼具两者之长：
+
+- superblock **v0**（ANSA 可读）
+- 但**没有** SNOD / TREE / HEAP（即不是 v1.6 sym-table 布局）
+- 也**没有** OHDR 签名（即不是 v2 object header）
+
+逐字节解码根组 object header（offset 0x60）发现：
+
+```
+=== Object header @ 0x60 ===
+  version: 1                    ← v1 object header（无签名）
+  num_msgs=15, ref_count=1
+  msg  0: type=0x02 (Link Info), size=40    ← HDF5 1.8 特性
+  msg  1: type=0x0A (Group Info), size=8    ← HDF5 1.8 特性
+  msg  2: type=0x10 (Object Header Continuation), size=16
+  msg  6: type=0x0C (Attribute), size=40
+  ...
+```
+
+即 **"v0 superblock + v1 object header 内嵌 HDF5 1.8 Link Info / Group Info 消息"** 的混合布局——既保持 v0 superblock 的向后兼容，又通过 1.8 的紧凑链接消息避免 SNOD / TREE / HEAP 开销。
+
+### 9.4 为什么 h5py 写不出 vendor 的紧凑 v0 布局
+
+触发该布局需在 GCPL 上调用 `H5Pset_link_phase_change(max_compact, min_dense)`，把 `min_dense` 设得足够大以禁用 dense storage，配合 `libver=('earliest', 'v108')`。但实测：
+
+1. **h5py 的 `PropGCID` 不导出** `set_link_phase_change` 方法（仅有 `set_attr_phase_change` 等近邻 API）。
+2. **通过 `ctypes` 绕过 h5py 直接调用 C 层** `H5Pset_link_phase_change` 虽然返回成功（`herr_t = 0`），且 `H5Pget_link_phase_change` 能读出设置的值，但 `H5Gcreate2` 在 `libver_low='earliest'` 时仍回退到 v1.6 sym-table 布局，生成的文件依然带 SNOD / TREE / HEAP。
+3. 类似地尝试 `H5Pset_sym_k(1, 1)` / `H5Pset_istore_k(1)` 缩小 B-tree 节点，文件可压到 44 KB，但 superblock 会被 HDF5 自动从 v0 升到 **v1**（因为非默认 `sym_k` 值需要 v1 superblock 来存储）——这也偏离 vendor 的 v0 格式。
+
+结论：**在当前 h5py 3.x（HDF5 lib 2.0.0）版本下无法精确复刻 vendor 的 35 KB 紧凑布局**。要么 73 KB v0 / sym-table（最稳），要么 31 KB v2 / compact（ANSA 拒绝）。
+
+### 9.5 取舍与最终选择
+
+| 候选 | superblock | ANSA 可读 | 大小 | 内容 vs 参考 |
+|------|-----------|-----------|------|--------------|
+| `libver=(earliest, v108)` ← **采纳** | **v0** | ✅ | 73 KB | PERFECT MATCH |
+| `libver=(v108, v108)` | v2 | ❌ "No bases found!" | 31 KB | PERFECT MATCH |
+| ctypes `set_sym_k(1,1) + set_istore_k(1)` | v1 | ⚠️ 未验证 ANSA | 44 KB | PERFECT MATCH |
+| vendor 参考（无法复刻） | v0 + 1.8 LinkInfo | ✅ | 35 KB | (基准) |
+
+**最终选择**：`libver=('earliest', 'v108')`（即 h5py 默认），写出 v0 superblock + v1.6 sym-table 布局。代价是文件比 vendor 大约 2 倍（多出的 ~42 KB 全部是 HDF5 元数据 SNOD/TREE/HEAP，与 CGNS 内容无关），但换来**与 ANSA 等所有 CGNS 工具的完全兼容性**。
+
+### 9.6 经验总结
+
+1. **`PERFECT MATCH` 是字段级等价，不保证字节级等价**。两个 CGNS 文件在 HDF5 层可以有完全不同的元数据编码（superblock 版本、对象头版本、链接存储模式）但保持完全相同的 CGNS 树内容。验证 CGNS 输出时不能只比内容，还要确认 superblock 版本符合目标读取器期望。
+2. **第三方 CGNS 读取器对 HDF5 文件格式版本的兼容范围差异巨大**。Tecplot、ParaView、官方 CGNS lib 通常都支持 v2 superblock；但部分 GUI 前置网格器（如 ANSA）的 CGNS 模块基于较旧的 HDF5 库，只接受 v0 / v1 superblock。**默认输出最老的 superblock 版本**是工业 CFD 互操作性的安全选择。
+3. **h5py 的 Python API 是 HDF5 C API 的精选子集**。GCPL 的 `H5Pset_link_phase_change`、FCPL 的 `H5Pset_sym_k` / `H5Pset_istore_k` 等关键 API 没有 Python 包装。虽然可以通过 ctypes 直接调用，但 HDF5 内部还有"libver 控制是否使用 1.8 特性"的硬约束，并非所有设置都能在所有 libver 下生效。
+4. **逐字节验证（superblock 版本、特征签名计数）**比仅依赖 h5py 高层 API 自检更可靠。本次 bug 之所以能定位，关键就在于对 `box_ansa_orig.cgns` 做了 superblock 字段解析和 OHDR / SNOD / TREE / HEAP 签名扫描，把"看起来一样的两个 CGNS"还原为字节级真实差异。
+5. **修复决策应优先正确性 > 文件大小**。31 KB → 73 KB 是 130% 的体积膨胀，但只要内容不变、所有目标工具都能读取，体积本身就是非功能性指标，让位于功能正确性。
+
+### 9.7 改动文件清单
+
+| 文件 | 改动 |
+|------|------|
+| `gph2cgns.py` | 把 `h5py.File(..., libver=("v108","v108"))` 改回 `libver=("earliest","v108")`；更新模块级注释解释 superblock 版本选择 |
+| `DEV_SUMMARY.md` | 本节（第四阶段） |
+| `GPH_FORMAT_SPEC.md` | 新增"CGNS 输出 HDF5 格式约束"章节

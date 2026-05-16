@@ -143,3 +143,92 @@ python gph_parser.py [box.gph]
 - 与 CGNS 的 ADF（Advanced Data Format）相似
 - 32 字符标签符合 ADF 节点标签约定
 - CRDL-FLD 可能表示 "Card/Record Field" 或厂商自定义格式
+
+---
+
+## 8. CGNS 输出 HDF5 格式约束（重要）
+
+> 本节描述的不是 GPH 输入格式，而是 `gph2cgns.py` 写出的 **CGNS 输出文件**在底层 HDF5 层面必须满足的兼容性约束。详细推导见 `DEV_SUMMARY.md` 第 9 章。
+
+### 8.1 HDF5 superblock 版本对下游 CFD 工具的影响
+
+HDF5 文件起始 8 字节是固定魔数 `\x89HDF\r\n\x1a\n`，紧接其后的第 9 字节（offset 8）是 **superblock 版本号**。常见的三种版本对应不同的 HDF5 文件格式特性：
+
+| superblock 版本 | 触发条件 | object header 格式 | 组存储 | 典型读取器兼容性 |
+|----------------|----------|---------------------|--------|------------------|
+| **v0** | `libver_low='earliest'`（h5py 默认） | v1（无 4 字节签名） | v1.6 sym-table（SNOD + TREE + HEAP） | **所有** CGNS 工具：ANSA、Tecplot、ParaView、CGNS 官方库 |
+| **v1** | 非默认 `H5Pset_sym_k` 或 `H5Pset_istore_k` | v1 | sym-table，但 B-tree 参数可调 | 同 v0，绝大多数工具 |
+| **v2** | `libver_low='v108'` 或更高 | v2（带 `OHDR` 4 字节签名） | compact link 或 dense（fractal heap） | ⚠️ **部分老旧 CGNS 模块不支持**，例如 **ANSA** 会报 `No bases found!` |
+
+### 8.2 已知不兼容案例：ANSA "No bases found!"
+
+**症状**：用 ANSA 导入 `gph2cgns.py` 生成的 CGNS 文件时报错：
+
+```
+No bases found!
+```
+
+**根因**：之前的提交曾设置 `h5py.File(libver=("v108","v108"))` 以启用 HDF5 1.8 紧凑链接存储（compact link storage），把输出文件从 73 KB 缩到 31 KB。该设置生成 **v2 superblock**，而 ANSA 的 CGNS 读取器只接受 v0 / v1 superblock，遇到 v2 时直接判定文件无 Base 节点。
+
+**修复**：固定使用 `libver=('earliest', 'v108')`（h5py 默认），即 **v0 superblock + v1.6 sym-table 布局**。代价是文件比官网 vendor 参考大约 2 倍（73 KB vs 35 KB），但保证所有目标 CFD 工具都能读取。
+
+### 8.3 vendor (`box_ansa_orig.cgns`) 的特殊紧凑布局
+
+官网 `FLDUTIL` 工具产生的参考文件 `box_ansa_orig.cgns` 兼具两者之长：
+
+- superblock **v0**（ANSA 可读）
+- 但**无** SNOD / TREE / HEAP（即不是 v1.6 sym-table）
+- 也**无** OHDR 签名（即不是 v2 object header）
+
+逐字节解码根组 object header 可见使用了 **v1 object header 内嵌 HDF5 1.8 Link Info / Group Info 消息**：
+
+```
+Object header @ 0x60 (root group):
+  version: 1                                    ← v1 object header（无签名）
+  msg 0: type=0x02 (Link Info), size=40        ← HDF5 1.8 紧凑链接
+  msg 1: type=0x0A (Group Info), size=8        ← HDF5 1.8 组信息
+  msg 6: type=0x0C (Attribute), size=40
+  ...
+```
+
+**该布局当前无法通过 h5py 复刻**：
+
+- `h5py.h5p.PropGCID` 未导出 `set_link_phase_change` Python 包装。
+- 即使通过 `ctypes` 直接调用 C 层 `H5Pset_link_phase_change` 在 GCPL / FCPL 上设置成功，HDF5 在 `libver_low='earliest'` 时仍会回退到 v1.6 sym-table 存储，无法触发 1.8 紧凑链接消息。
+
+因此 `gph2cgns.py` 选择最稳妥的 **v0 superblock + v1.6 sym-table**（73 KB），与 vendor 内容字段级 `PERFECT MATCH`，仅 HDF5 元数据布局不同。
+
+### 8.4 HDF5 签名速查表（用于逐字节诊断 CGNS 输出）
+
+| 签名（4 字节 ASCII） | 含义 | 出现意味着 |
+|---------------------|------|------------|
+| `\x89HDF\r\n\x1a\n` | HDF5 魔数（offset 0） | 文件是 HDF5 容器 |
+| `OHDR` | v2 object header | superblock 必为 v2，ANSA 等老读取器可能拒绝 |
+| `OCHK` | object header continuation chunk (v2) | 同上 |
+| `SNOD` | v1.6 symbol-table node | v0/v1 superblock + v1.6 组存储 |
+| `TREE` | v1 B-tree | 同上，每组一个 |
+| `HEAP` | v1 local heap | 同上，每组一个 |
+| `FRHP` | fractal heap header | dense link 或 attribute 存储，HDF5 1.8+ |
+| `BTHD` | v2 B-tree header | dense link 索引，HDF5 1.8+ |
+| `GCOL` | global heap collection | 变长数据集（如 string）共享存储 |
+
+诊断命令示例：
+
+```bash
+python3 -c "
+data = open('your.cgns','rb').read()
+print(f'size={len(data)} sb_v={data[8]}')
+for sig in (b'OHDR', b'SNOD', b'TREE', b'HEAP', b'FRHP', b'BTHD'):
+    print(f'  {sig.decode()}: {data.count(sig)}')
+"
+```
+
+### 8.5 输出文件 sanity check
+
+`gph2cgns.py` 生成的 CGNS 应满足：
+
+- `data[8] == 0` （superblock v0）
+- `OHDR` count = 0
+- `SNOD` count > 0（与组数量相当）
+- 通过 `h5py.File(path, 'r')` 可正常打开并读取 `Base` / `Base/<Zone>` / 各 `Elements_t` 子节点
+- ZoneType 数据集字节序列为 `Unstructured`
