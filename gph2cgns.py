@@ -83,6 +83,8 @@ def _section_end(data: bytes, sec_start: int) -> int:
         "GridType", "Dimension", "Bias", "Date", "Comments", "Cycle",
         "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
         "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
+        "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
+        "LS_Assemblies",
         "Element_InformationFlag", "OverlapEnd",
     ]
     best = len(data)
@@ -361,6 +363,139 @@ def _parse_ls_links(data: bytes):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LS_CvolIdOfElements / LS_VolumeRegions / LS_Parts / LS_Assemblies
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These four sections together describe how the mesh is partitioned into
+# CGNS zones by the FLDUTIL exporter.  The vendor's reference file
+# `tr03_orig.cgns` for example contains 7 zones (5 volume regions +
+# 2 parts) that all share the same underlying mesh.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_ls_cvol_ids(data: bytes) -> Optional[np.ndarray]:
+    """Parse ``LS_CvolIdOfElements`` → 1-D int64 array, one entry per cell.
+
+    Each entry holds the 1-based **Part index** of the cell.  For instance in
+    ``tr03.gph`` this array has 63 882 entries with values 1 (Case part) or
+    2 (Rotate part).  Returns ``None`` if the section is missing or malformed.
+    """
+    sec_start = _find_section(data, "LS_CvolIdOfElements")
+    if sec_start < 0:
+        return None
+    sec_end = _section_end(data, sec_start)
+    for p, bc in _iter_data_blocks(data, sec_start, sec_end):
+        if bc % 4 == 0 and bc >= 4:
+            return np.frombuffer(data[p : p + bc], dtype=">i4").astype(np.int64).copy()
+    return None
+
+
+def _parse_ls_string_section(data: bytes, section_name: str) -> list[str]:
+    """Return the list of ASCII strings stored in a section like
+    ``LS_VolumeRegions`` or ``LS_Parts``."""
+    sec_start = _find_section(data, section_name)
+    if sec_start < 0:
+        return []
+    sec_end = _section_end(data, sec_start)
+    out: list[str] = []
+    for p, bc in _iter_data_blocks(data, sec_start, sec_end):
+        raw = data[p : p + bc]
+        # ASCII-only payload, NUL/space-padded
+        if all(b == 0 or 32 <= b < 127 for b in raw):
+            s = raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+            if s:
+                out.append(s)
+    return out
+
+
+def _parse_ls_assemblies(data: bytes) -> dict[str, Optional[str]]:
+    """Parse ``LS_Assemblies`` XML → mapping ``part_name → assembly_name``.
+
+    Parts that live at the XML root (not nested inside an ``<assembly>``)
+    map to ``None`` and are emitted by the writer as ``FPHPARTS.<part>``;
+    parts inside ``<assembly name="A">`` are emitted as
+    ``FPHPARTS.A.<part>``.
+    """
+    sec_start = _find_section(data, "LS_Assemblies")
+    if sec_start < 0:
+        return {}
+    sec_end = _section_end(data, sec_start)
+    xml_bytes = b""
+    for p, bc in _iter_data_blocks(data, sec_start, sec_end):
+        chunk = data[p : p + bc]
+        if chunk.lstrip().startswith(b"<?xml") or b"<part" in chunk:
+            xml_bytes = chunk
+            break
+    if not xml_bytes:
+        return {}
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+    mapping: dict[str, Optional[str]] = {}
+    # Parts inside <assembly> nodes
+    for assembly in root.iter("assembly"):
+        a_name = assembly.get("name")
+        for part in assembly.findall("part"):
+            p_name = part.get("name")
+            if p_name:
+                mapping[p_name] = a_name
+    # Parts at the XML root that are NOT inside any assembly
+    for part in root.findall("part"):
+        p_name = part.get("name")
+        if p_name and p_name not in mapping:
+            mapping[p_name] = None
+    return mapping
+
+
+def _classify_zone_cells(zone_name: str, part_names: list[str],
+                          cvol_id: Optional[np.ndarray], n_cells: int) -> np.ndarray:
+    """Return a boolean cell-mask selecting cells that belong to *zone_name*.
+
+    Cell membership for each CGNS zone is **not stored explicitly** in the
+    GPH file — it must be derived from the ``LS_CvolIdOfElements`` part
+    assignment and the zone name (which the upstream ANSA / scFLOW workflow
+    encodes via naming conventions):
+
+    * ``FluidRegion`` — convention for the *whole* mesh.
+    * ``@VPartRegion_<P>[<N>]`` — exactly the cells of Part ``P``.
+    * ``FPHPARTS.[<assembly>.]<P>`` — exactly the cells of Part ``P``.
+    * Other names — substring-match a Part name; falls back to the whole
+      mesh if no part is mentioned.
+    """
+    all_mask = np.ones(n_cells, dtype=bool)
+    if zone_name == "FluidRegion":
+        return all_mask
+    if cvol_id is None or len(cvol_id) != n_cells or not part_names:
+        return all_mask
+
+    # Explicit `FPHPARTS.[<asm>.]<part>` zone name
+    if zone_name.startswith("FPHPARTS."):
+        suffix = zone_name[len("FPHPARTS.") :]
+        candidate = suffix.rsplit(".", 1)[-1]
+        if candidate in part_names:
+            return cvol_id == (part_names.index(candidate) + 1)
+
+    # `@VPartRegion_<part>[<n>]` zone name → strip prefix and trailing `[n]`
+    if zone_name.startswith("@VPartRegion_"):
+        rem = zone_name[len("@VPartRegion_") :]
+        rem = rem.split("[", 1)[0]
+        if rem in part_names:
+            return cvol_id == (part_names.index(rem) + 1)
+
+    # Substring fallback: pick the longest Part name that appears inside the
+    # zone name (longer names are more specific).
+    matches = sorted(
+        (p for p in part_names if p and p in zone_name),
+        key=len, reverse=True,
+    )
+    if matches:
+        return cvol_id == (part_names.index(matches[0]) + 1)
+    return all_mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Vertex renumbering — match the official FLDUTIL exporter's ordering
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -405,6 +540,11 @@ def parse_gph_mesh(filepath: str) -> dict:
     The returned vertices/face_nodes have already been renumbered so that the
     output CGNS matches the vendor's own conversion (vertices appear in the
     order they are first referenced by the face connectivity).
+
+    The result also carries the zone-partition metadata needed to write a
+    multi-Zone CGNS that mirrors the vendor's FLDUTIL exporter
+    (``LS_CvolIdOfElements``, ``LS_VolumeRegions``, ``LS_Parts``,
+    ``LS_Assemblies`` XML).
     """
     with open(filepath, "rb") as f:
         data = f.read()
@@ -414,10 +554,20 @@ def parse_gph_mesh(filepath: str) -> dict:
         "n_vertices": 0,
         "link_data": None,
         "n_elements": 0,
+        "cvol_id": None,
+        "volume_regions": [],
+        "parts": [],
+        "part_assembly": {},
     }
 
     xyz, n_vertices = _parse_ls_nodes(data)
     link_data = _parse_ls_links(data)
+
+    # Partition metadata is always parsed if present, even if mesh is broken.
+    result["cvol_id"] = _parse_ls_cvol_ids(data)
+    result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
+    result["parts"] = _parse_ls_string_section(data, "LS_Parts")
+    result["part_assembly"] = _parse_ls_assemblies(data)
 
     if xyz is None or n_vertices == 0 or link_data is None:
         return result
@@ -558,6 +708,149 @@ def _write_ngon(zone, face_nodes_1based_flat: np.ndarray,
     _i32_dataset(ec, " data", face_nodes_1based_flat)
 
 
+def _extract_zone_submesh(vertices: np.ndarray, link_data: dict,
+                            cell_mask: np.ndarray) -> dict:
+    """Return a self-contained sub-mesh describing only the cells selected
+    by *cell_mask*.
+
+    Each output CGNS Zone is a stand-alone unstructured mesh with its own
+    local vertex / face / cell numbering (1-based when written to CGNS).
+    This helper performs the renumbering and produces an object that
+    structurally matches the ``link_data`` shape so the existing CGNS-writer
+    code paths can be reused unchanged.
+
+    Algorithm
+    ---------
+    1. *Faces in the sub-mesh* are those whose owner OR neighbour belongs
+       to the selected cell set.
+    2. *Vertices in the sub-mesh* are the union of the face-node lists of
+       the kept faces.
+    3. Face / vertex / cell IDs are renumbered to a dense 0-based range
+       (then converted to 1-based when written to CGNS).
+    4. Faces that originally had ``neighbour == -1`` (boundary of the full
+       mesh) remain boundary faces of the sub-mesh.  Faces whose
+       owner-or-neighbour pair straddles the zone boundary become
+       *new boundary faces* of the sub-mesh; we still keep them with their
+       valid (in-zone) side as the owner so the sub-mesh has a closed
+       surface.
+    """
+    n_cells_full = link_data["n_cells"]
+    n_faces_full = link_data["n_faces"]
+    owner_full = link_data["owner"]
+    neigh_full = link_data["neighbor"]
+    face_nodes_full = link_data["face_nodes"]
+    face_offsets_full = link_data["face_offsets"]
+    npe_full = link_data["npe"]
+
+    cell_mask = cell_mask.astype(bool)
+
+    # ── 1. Pick faces incident on the zone ────────────────────────────────
+    owner_in = np.zeros(n_faces_full, dtype=bool)
+    neigh_in = np.zeros(n_faces_full, dtype=bool)
+    ow_arr = owner_full
+    valid_ow = (ow_arr >= 0) & (ow_arr < n_cells_full)
+    owner_in[valid_ow] = cell_mask[ow_arr[valid_ow]]
+    nb_arr = neigh_full
+    valid_nb = (nb_arr >= 0) & (nb_arr < n_cells_full)
+    neigh_in[valid_nb] = cell_mask[nb_arr[valid_nb]]
+
+    face_mask = owner_in | neigh_in
+    kept_face_ids = np.where(face_mask)[0]
+    n_faces_sub = int(kept_face_ids.size)
+
+    # ── 2. Renumber face owners / neighbours so the kept (in-zone) cell
+    #     is always the owner.  Track which side originally had it. ───────
+    new_owner = np.full(n_faces_sub, -1, dtype=np.int64)
+    new_neigh = np.full(n_faces_sub, -1, dtype=np.int64)
+    flip = np.zeros(n_faces_sub, dtype=bool)
+
+    ow_kept = ow_arr[kept_face_ids]
+    nb_kept = nb_arr[kept_face_ids]
+    own_inzone = owner_in[kept_face_ids]
+    nb_inzone = neigh_in[kept_face_ids]
+    both_inzone = own_inzone & nb_inzone
+
+    new_owner[own_inzone] = ow_kept[own_inzone]
+    new_neigh[both_inzone] = nb_kept[both_inzone]
+    only_nb = nb_inzone & ~own_inzone
+    new_owner[only_nb] = nb_kept[only_nb]
+    flip[only_nb] = True
+
+    # ── 3. Re-index cells (kept cells → 0..n_cells_sub-1) ─────────────────
+    kept_cell_ids = np.where(cell_mask)[0]
+    cell_remap = np.full(n_cells_full, -1, dtype=np.int64)
+    cell_remap[kept_cell_ids] = np.arange(kept_cell_ids.size, dtype=np.int64)
+    new_owner[new_owner >= 0] = cell_remap[new_owner[new_owner >= 0]]
+    new_neigh_in_zone_mask = new_neigh >= 0
+    new_neigh[new_neigh_in_zone_mask] = cell_remap[new_neigh[new_neigh_in_zone_mask]]
+    n_cells_sub = int(kept_cell_ids.size)
+
+    # ── 4. Slice face_nodes for kept faces ────────────────────────────────
+    sub_npe = npe_full[kept_face_ids]
+    sub_face_offsets = np.empty(n_faces_sub + 1, dtype=np.int64)
+    sub_face_offsets[0] = 0
+    np.cumsum(sub_npe, out=sub_face_offsets[1:])
+
+    sub_total_conn = int(sub_face_offsets[-1])
+    sub_face_nodes = np.empty(sub_total_conn, dtype=np.int64)
+    # Per-face copy: vectorised gather via per-face ranges.
+    # For very large sub-meshes this is the hot loop; numpy fancy indexing
+    # over a single concatenated index array is roughly 10× faster than
+    # a Python for-loop.
+    write_pos = sub_face_offsets[:-1]
+    # Build a single source-index array by concatenating per-face slices.
+    src_indices = np.concatenate([
+        np.arange(face_offsets_full[fi], face_offsets_full[fi + 1],
+                  dtype=np.int64)
+        for fi in kept_face_ids
+    ]) if n_faces_sub else np.empty(0, dtype=np.int64)
+    sub_face_nodes[:] = face_nodes_full[src_indices]
+
+    # If a face's owner/neighbour roles were swapped, reverse its node order
+    # so the CGNS face-normal convention is preserved (the surface still
+    # points *outward* from the in-zone cell).
+    if flip.any():
+        for li in np.where(flip)[0]:
+            s = int(sub_face_offsets[li])
+            e = int(sub_face_offsets[li + 1])
+            sub_face_nodes[s:e] = sub_face_nodes[s:e][::-1]
+
+    # ── 5. Re-index vertices (kept vertices → 0..n_verts_sub-1) ──────────
+    used_v = np.unique(sub_face_nodes)
+    n_verts_sub = int(used_v.size)
+    v_remap = np.full(vertices.shape[0], -1, dtype=np.int64)
+    v_remap[used_v] = np.arange(n_verts_sub, dtype=np.int64)
+    sub_face_nodes = v_remap[sub_face_nodes]
+    sub_vertices = vertices[used_v]
+
+    # ── 6. Build per-cell face lists (owner/neighbour) ────────────────────
+    cell_owner_faces: dict = defaultdict(list)
+    cell_neighbor_faces: dict = defaultdict(list)
+    for li in range(n_faces_sub):
+        ow = int(new_owner[li])
+        if 0 <= ow < n_cells_sub:
+            cell_owner_faces[ow].append(li)
+        nb = int(new_neigh[li])
+        if 0 <= nb < n_cells_sub:
+            cell_neighbor_faces[nb].append(li)
+
+    boundary_faces = list(np.where(new_neigh == -1)[0])
+
+    sub_link = {
+        "n_faces": n_faces_sub,
+        "npe": sub_npe,
+        "face_nodes": sub_face_nodes,
+        "face_offsets": sub_face_offsets,
+        "owner": new_owner,
+        "neighbor": new_neigh,
+        "boundary_faces": boundary_faces,
+        "cell_owner_faces": cell_owner_faces,
+        "cell_neighbor_faces": cell_neighbor_faces,
+        "n_cells": n_cells_sub,
+    }
+    return {"vertices": sub_vertices, "link_data": sub_link}
+
+
 def _build_nface_connectivity(link_data: dict):
     """Return ``(offsets, conn, n_cells)`` for the CGNS NFACE_n section.
 
@@ -648,8 +941,69 @@ def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict) -> 
     _write_flow_solution(zone)
 
 
+def _build_zone_plan(mesh: dict,
+                      override_zone_names: Optional[tuple] = None) -> list[tuple[str, np.ndarray]]:
+    """Return the ordered list of ``(zone_name, cell_mask)`` to emit.
+
+    Driven by the partition metadata parsed from ``LS_VolumeRegions``,
+    ``LS_Parts`` and ``LS_Assemblies``.  Falls back to a single
+    ``FluidRegion`` + ``FPHPARTS.<part>`` pair when no partition metadata
+    is present (matches the legacy ``box_ansa.gph`` behaviour).
+    """
+    link_data = mesh["link_data"]
+    n_cells = int(link_data["n_cells"])
+    cvol_id = mesh.get("cvol_id")
+    parts = mesh.get("parts", [])
+    regions = mesh.get("volume_regions", [])
+    assembly_map = mesh.get("part_assembly", {})
+
+    # CLI override: caller supplied an explicit zone name list.
+    if override_zone_names:
+        all_mask = np.ones(n_cells, dtype=bool)
+        return [(name, all_mask) for name in override_zone_names]
+
+    # Build the ordered zone list.  Volume regions come first (in file
+    # order), followed by parts.  This matches the vendor's output:
+    #
+    #   tr03_orig.cgns Base/ children order =
+    #     Rotate_MovingVolumeRegion, FluidRegion, Rotate_Moving,
+    #     @VPartRegion_Case[2], @VPartRegion_Rotate[2],
+    #     FPHPARTS.tr03.Case, FPHPARTS.Rotate
+    plan: list[tuple[str, np.ndarray]] = []
+
+    if not regions and not parts:
+        # No partition metadata — fall back to the legacy 2-zone layout.
+        all_mask = np.ones(n_cells, dtype=bool)
+        plan.append(("FluidRegion", all_mask))
+        plan.append(("FPHPARTS.box_vol", all_mask))
+        return plan
+
+    # Volume regions (use the names as stored in the GPH file).
+    for region in regions:
+        mask = _classify_zone_cells(region, parts, cvol_id, n_cells)
+        plan.append((region, mask))
+
+    # If LS_VolumeRegions does NOT include "FluidRegion" but a full-mesh
+    # zone is conventional, prepend it so downstream CFD tools always have
+    # an "all cells" view.  In tr03 this entry already exists; in box_ansa
+    # it does too — only synthetic / hand-crafted files would need this.
+    if not any(name == "FluidRegion" for name, _ in plan) and len(parts) > 0:
+        plan.insert(0, ("FluidRegion", np.ones(n_cells, dtype=bool)))
+
+    # Parts (each becomes one FPHPARTS.* zone).
+    for idx, part in enumerate(parts, start=1):
+        a_name = assembly_map.get(part)
+        zone_name = (f"FPHPARTS.{a_name}.{part}" if a_name
+                     else f"FPHPARTS.{part}")
+        mask = (cvol_id == idx) if (cvol_id is not None and len(cvol_id) == n_cells) \
+                                 else np.ones(n_cells, dtype=bool)
+        plan.append((zone_name, mask))
+
+    return plan
+
+
 def write_cgns(mesh: dict, outpath: str,
-               zone_names=("FluidRegion", "FPHPARTS.box_vol")) -> None:
+               zone_names: Optional[tuple] = None) -> None:
     """Write *mesh* to a CGNS/HDF5 file using the FLDUTIL exporter's layout.
 
     The resulting file contains:
@@ -660,9 +1014,11 @@ def write_cgns(mesh: dict, outpath: str,
     * ``Base`` (CGNSBase_t, I4 ``[3, 3]``)
         * ``ReferenceState`` → ``ReferenceStateDescription`` =
           ``"Software Cradle FLDUTIL"``
-        * One ``Zone_t`` per name in *zone_names* — by default the writer
-          produces two identical zones (`FluidRegion` and `FPHPARTS.box_vol`)
-          to mirror the vendor's own export.
+        * One ``Zone_t`` per partition discovered in the GPH metadata
+          (``LS_VolumeRegions`` + ``LS_Parts`` + ``LS_Assemblies``).  Falls
+          back to the legacy ``FluidRegion`` + ``FPHPARTS.box_vol`` pair
+          when no partition metadata is present.  Passing *zone_names*
+          forces a specific list of full-mesh zones (legacy compatibility).
     """
     vertices = mesh["vertices"]
     link_data = mesh.get("link_data")
@@ -670,6 +1026,8 @@ def write_cgns(mesh: dict, outpath: str,
         raise ValueError("No vertices to write")
     if link_data is None:
         raise ValueError("No face/cell connectivity data (LS_Links parse failed)")
+
+    zone_plan = _build_zone_plan(mesh, override_zone_names=zone_names)
 
     # Use ``libver=("earliest", "v108")`` (h5py's default) to write a
     # **v0 superblock** file.  Some CGNS readers — notably ANSA — refuse
@@ -703,8 +1061,13 @@ def write_cgns(mesh: dict, outpath: str,
         rsd = _cgns_node(rs, "ReferenceStateDescription", "Descriptor_t", "C1")
         _bytes_dataset(rsd, " data", b"Software Cradle FLDUTIL")
 
-        for zname in zone_names:
-            _write_zone(base, zname, vertices, link_data)
+        for zname, cell_mask in zone_plan:
+            if cell_mask.all():
+                # Whole-mesh zone — no sub-mesh extraction needed.
+                _write_zone(base, zname, vertices, link_data)
+            else:
+                sub = _extract_zone_submesh(vertices, link_data, cell_mask)
+                _write_zone(base, zname, sub["vertices"], sub["link_data"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -755,10 +1118,17 @@ def main():
         print("Error: could not extract mesh data from GPH.")
         sys.exit(1)
 
+    # Show the zone plan that will be emitted (volume regions + parts as
+    # parsed from LS_VolumeRegions / LS_Parts / LS_Assemblies XML).
     if args.single_zone:
         zone_names = (args.zone or "FluidRegion",)
     else:
-        zone_names = ("FluidRegion", "FPHPARTS.box_vol")
+        zone_names = None  # let write_cgns infer from the partition metadata
+    plan = _build_zone_plan(mesh, override_zone_names=zone_names)
+    print(f"  Zones    : {len(plan)}")
+    for zname, mask in plan:
+        cell_count = int(mask.sum())
+        print(f"             - {zname}  ({cell_count} cells)")
 
     print(f"Writing: {out_path}")
     write_cgns(mesh, str(out_path), zone_names=zone_names)
