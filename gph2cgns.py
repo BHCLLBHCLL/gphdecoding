@@ -408,6 +408,78 @@ def _parse_ls_string_section(data: bytes, section_name: str) -> list[str]:
     return out
 
 
+def _parse_ls_parts_with_cvol_ids(data: bytes) -> list[tuple[str, int]]:
+    """Parse ``LS_Parts`` returning ``[(part_name, cvol_id)]`` in file order.
+
+    The cvol_id of each part is NOT its 1-based position in ``LS_Parts``.
+    For ``box_ansa.gph`` it happens to be 1 for the single part; for
+    ``tr03.gph`` it is (1, 2) which matches the index, but for
+    ``laptop_simplified_voxel_less.gph`` it is (1, 9, 11) — clearly
+    an opaque scFLOW-side identifier.
+
+    The actual cvol_id is encoded as the ``d0`` field of a
+    ``[12, 4, <cvol_id>, 4]`` descriptor sitting *after* each part's
+    255-byte ASCII name block.  Concretely the layout of each part is::
+
+        [12, 4, 1, 1]           ← marker
+        [12, 4, 1, 4]           ← marker
+        [12, 4, 1, 1]           ← marker
+        [12, 4, 255, 4]         ← name length descriptor
+        [12, 1, 255, 1]         ← type marker for the ASCII block
+        [<part name>, 255 B]    ← part name (NUL/space padded)
+        [trailer = 255]         ← 4-byte trailer
+        [12, 4, 1, 1]           ← post-name marker
+        [12, 4, 1, 4]           ← post-name marker
+        [12, 4, 1, 1]           ← post-name marker
+        [12, 4, <cvol_id>, 4]   ← THE cvol_id for this part
+
+    The cvol_id descriptor of each part is therefore the LAST
+    ``[12, 4, X, 4]`` descriptor before either the *next* part's name
+    block or the end of the section.
+    """
+    sec_start = _find_section(data, "LS_Parts")
+    if sec_start < 0:
+        return []
+    sec_end = _section_end(data, sec_start)
+
+    # 1) Locate every part name block: each is an ASCII payload of 255 B
+    #    preceded by a [12, 4, 255, 4] descriptor.  Record the byte
+    #    offset where the name's data block STARTS (i.e. position of the
+    #    8-byte data header [12, 255]).
+    name_blocks: list[tuple[str, int, int]] = []  # (name, name_data_start, name_data_end)
+    for p, bc in _iter_data_blocks(data, sec_start, sec_end):
+        if bc != 255:
+            continue
+        raw = data[p : p + bc]
+        if not all(b == 0 or 32 <= b < 127 for b in raw):
+            continue
+        name = raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+        if not name or not any(c.isalpha() for c in name):
+            continue
+        # The data header [12, 255] sits 8 B before the payload.  The
+        # 4-byte trailer = 255 sits at payload_end.  The cvol_id descriptor
+        # block starts after that trailer.
+        name_blocks.append((name, p - 8, p + bc + 4))
+
+    # 2) For each part, scan the descriptors between its name-block end
+    #    and the next part's name-block start, looking for the last
+    #    ``[12, 4, X, 4]`` descriptor.
+    out: list[tuple[str, int]] = []
+    for i, (name, _, after_trailer) in enumerate(name_blocks):
+        scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
+        cvol_id: Optional[int] = None
+        p = after_trailer
+        while p + 16 <= scan_end:
+            if (read_i32_be(data, p) == 12
+                    and read_i32_be(data, p + 4) == 4
+                    and read_i32_be(data, p + 12) == 4):
+                cvol_id = read_i32_be(data, p + 8)
+            p += 4
+        if cvol_id is not None:
+            out.append((name, int(cvol_id)))
+    return out
+
+
 def _parse_ls_surface_regions(data: bytes) -> list[tuple[str, np.ndarray]]:
     """Parse ``LS_SurfaceRegions`` into a list of ``(name, gph_face_ids)``.
 
@@ -461,17 +533,37 @@ def _parse_ls_surface_regions(data: bytes) -> list[tuple[str, np.ndarray]]:
     return regions
 
 
-def _parse_ls_assemblies(data: bytes) -> dict[str, Optional[str]]:
-    """Parse ``LS_Assemblies`` XML → mapping ``part_name → assembly_name``.
+def _parse_ls_assemblies(data: bytes) -> dict:
+    """Parse ``LS_Assemblies`` XML and return a dict::
 
-    Parts that live at the XML root (not nested inside an ``<assembly>``)
-    map to ``None`` and are emitted by the writer as ``FPHPARTS.<part>``;
-    parts inside ``<assembly name="A">`` are emitted as
-    ``FPHPARTS.A.<part>``.
+        {
+            'part_paths': {part_name: 'asm1.asm2....partname' or None},
+            'root_empty_prefix': '<asm1>.<asm2>...' or None,
+            'has_assemblies': bool,
+            'raw_xml': str,
+        }
+
+    * ``part_paths[p]`` — full XML-hierarchical path to the part, joined
+      with ``.``.  Equals ``None`` if the part is at the XML root (no
+      enclosing ``<assembly>``).
+    * ``root_empty_prefix`` — for files whose XML places parts at the
+      root level but also contains *empty* ``<assembly>`` siblings, the
+      vendor exporter prepends a path built from those empty assemblies
+      to each root part.  For ``laptop_simplified_voxel_less.gph`` this
+      is ``"fan2.fan1"`` (the first 2 empty assemblies under the single
+      top-level assembly, matching the 2 root-level parts).  ``None``
+      when no such promotion is possible (e.g. ``tr03.gph``,
+      ``box_ansa.gph``).
     """
     sec_start = _find_section(data, "LS_Assemblies")
+    empty: dict = {
+        "part_paths": {},
+        "root_empty_prefix": None,
+        "has_assemblies": False,
+        "raw_xml": "",
+    }
     if sec_start < 0:
-        return {}
+        return empty
     sec_end = _section_end(data, sec_start)
     xml_bytes = b""
     for p, bc in _iter_data_blocks(data, sec_start, sec_end):
@@ -480,71 +572,118 @@ def _parse_ls_assemblies(data: bytes) -> dict[str, Optional[str]]:
             xml_bytes = chunk
             break
     if not xml_bytes:
-        return {}
+        return empty
     try:
         import xml.etree.ElementTree as ET
         root = ET.fromstring(xml_bytes.decode("utf-8", errors="replace"))
     except Exception:
-        return {}
-    mapping: dict[str, Optional[str]] = {}
-    # Parts inside <assembly> nodes
-    for assembly in root.iter("assembly"):
-        a_name = assembly.get("name")
-        for part in assembly.findall("part"):
-            p_name = part.get("name")
-            if p_name:
-                mapping[p_name] = a_name
-    # Parts at the XML root that are NOT inside any assembly
-    for part in root.findall("part"):
-        p_name = part.get("name")
-        if p_name and p_name not in mapping:
-            mapping[p_name] = None
-    return mapping
+        return empty
+
+    # Walk the XML tree to compute each part's full path.
+    part_paths: dict[str, Optional[str]] = {}
+    has_assemblies = any(True for _ in root.iter("assembly"))
+
+    def _walk(node, ancestors: list[str]):
+        for child in node:
+            if child.tag == "assembly":
+                aname = child.get("name", "")
+                _walk(child, ancestors + [aname] if aname else ancestors)
+            elif child.tag == "part":
+                pname = child.get("name", "")
+                if not pname:
+                    continue
+                if ancestors:
+                    part_paths[pname] = ".".join(ancestors + [pname])
+                else:
+                    part_paths[pname] = None  # root-level part
+
+    _walk(root, [])
+
+    # Collect root-level empty assemblies *inside* the first top-level
+    # assembly (matches the ``laptop_3d_geom`` → ``fan2/fan1/solid_region``
+    # pattern observed in the vendor file).  We also count root-level
+    # parts: the vendor consumes one empty-assembly slot per root-level
+    # part to build the shared prefix.
+    root_parts_count = sum(1 for part in root.findall("part") if part.get("name"))
+    root_empty_prefix: Optional[str] = None
+    if root_parts_count > 0:
+        # Pick the FIRST top-level assembly (typically the project name)
+        top_asm = next(iter(root.findall("assembly")), None)
+        if top_asm is not None:
+            empty_asm_names: list[str] = []
+            for child in top_asm.findall("assembly"):
+                # "Empty" = no <part> or <assembly> descendants
+                if (len(child.findall("assembly")) == 0
+                        and len(child.findall("part")) == 0):
+                    name = child.get("name", "")
+                    if name:
+                        empty_asm_names.append(name)
+            if len(empty_asm_names) >= root_parts_count:
+                # Vendor convention: take the first ``root_parts_count``
+                # empty assemblies as a shared prefix path for every
+                # root-level part.
+                root_empty_prefix = ".".join(empty_asm_names[:root_parts_count])
+
+    return {
+        "part_paths": part_paths,
+        "root_empty_prefix": root_empty_prefix,
+        "has_assemblies": has_assemblies,
+        "raw_xml": xml_bytes.decode("utf-8", errors="replace"),
+    }
 
 
-def _classify_zone_cells(zone_name: str, part_names: list[str],
+def _classify_zone_cells(zone_name: str,
+                          parts_with_cvol: list[tuple[str, int]],
                           cvol_id: Optional[np.ndarray], n_cells: int) -> np.ndarray:
     """Return a boolean cell-mask selecting cells that belong to *zone_name*.
 
-    Cell membership for each CGNS zone is **not stored explicitly** in the
-    GPH file — it must be derived from the ``LS_CvolIdOfElements`` part
-    assignment and the zone name (which the upstream ANSA / scFLOW workflow
-    encodes via naming conventions):
+    Cell membership is derived from the ``LS_CvolIdOfElements`` array and a
+    name-based heuristic over *parts_with_cvol*, the ``[(part_name, cvol_id)]``
+    list parsed from ``LS_Parts``.  ``cvol_id`` is the array of per-cell IDs
+    that may be sparse / non-sequential (e.g. tr03 uses ``{1, 2}`` but
+    laptop_simplified_voxel_less uses ``{1, 9, 11}``); the mapping
+    ``part → cvol_id`` is read from the part descriptors directly so the
+    GPH-internal labels don't have to match the part-list ordering.
+
+    Recognised zone-name patterns:
 
     * ``FluidRegion`` — convention for the *whole* mesh.
     * ``@VPartRegion_<P>[<N>]`` — exactly the cells of Part ``P``.
-    * ``FPHPARTS.[<assembly>.]<P>`` — exactly the cells of Part ``P``.
-    * Other names — substring-match a Part name; falls back to the whole
-      mesh if no part is mentioned.
+    * Any zone name that contains a part name as a substring (e.g.
+      ``FPHPARTS.<asm>.<P>``, ``<asm1>.<asm2>.<P>``, or the vendor's
+      ``fan2.fan1.rotation1`` pattern) — exactly the cells of that part.
     """
     all_mask = np.ones(n_cells, dtype=bool)
     if zone_name == "FluidRegion":
         return all_mask
-    if cvol_id is None or len(cvol_id) != n_cells or not part_names:
+    if cvol_id is None or len(cvol_id) != n_cells or not parts_with_cvol:
         return all_mask
 
-    # Explicit `FPHPARTS.[<asm>.]<part>` zone name
-    if zone_name.startswith("FPHPARTS."):
-        suffix = zone_name[len("FPHPARTS.") :]
-        candidate = suffix.rsplit(".", 1)[-1]
-        if candidate in part_names:
-            return cvol_id == (part_names.index(candidate) + 1)
+    # Build name → cvol_id lookup.
+    name_to_cvol = {name: cv for name, cv in parts_with_cvol}
 
     # `@VPartRegion_<part>[<n>]` zone name → strip prefix and trailing `[n]`
     if zone_name.startswith("@VPartRegion_"):
         rem = zone_name[len("@VPartRegion_") :]
         rem = rem.split("[", 1)[0]
-        if rem in part_names:
-            return cvol_id == (part_names.index(rem) + 1)
+        if rem in name_to_cvol:
+            return cvol_id == name_to_cvol[rem]
 
-    # Substring fallback: pick the longest Part name that appears inside the
-    # zone name (longer names are more specific).
+    # `FPHPARTS.<...>.<part>` — the trailing component is the part name
+    if zone_name.startswith("FPHPARTS."):
+        suffix = zone_name[len("FPHPARTS.") :]
+        candidate = suffix.rsplit(".", 1)[-1]
+        if candidate in name_to_cvol:
+            return cvol_id == name_to_cvol[candidate]
+
+    # General substring fallback: pick the longest Part name that appears
+    # inside the zone name (longer names are more specific).
     matches = sorted(
-        (p for p in part_names if p and p in zone_name),
+        (p for p, _ in parts_with_cvol if p and p in zone_name),
         key=len, reverse=True,
     )
     if matches:
-        return cvol_id == (part_names.index(matches[0]) + 1)
+        return cvol_id == name_to_cvol[matches[0]]
     return all_mask
 
 
@@ -620,8 +759,20 @@ def parse_gph_mesh(filepath: str) -> dict:
     # Partition metadata is always parsed if present, even if mesh is broken.
     result["cvol_id"] = _parse_ls_cvol_ids(data)
     result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
-    result["parts"] = _parse_ls_string_section(data, "LS_Parts")
-    result["part_assembly"] = _parse_ls_assemblies(data)
+    result["parts_with_cvol"] = _parse_ls_parts_with_cvol_ids(data)
+    # Backward-compat: legacy ``parts`` list of just the part names.
+    result["parts"] = [name for name, _ in result["parts_with_cvol"]]
+    result["assembly_info"] = _parse_ls_assemblies(data)
+    # Backward-compat: legacy ``part_assembly`` (part_name → immediate parent
+    # assembly name).  Re-derived from the full path.
+    legacy_part_asm: dict[str, Optional[str]] = {}
+    for pname, path in result["assembly_info"]["part_paths"].items():
+        if path is None:
+            legacy_part_asm[pname] = None
+        else:
+            parts_of_path = path.split(".")
+            legacy_part_asm[pname] = parts_of_path[-2] if len(parts_of_path) >= 2 else None
+    result["part_assembly"] = legacy_part_asm
     result["surface_regions"] = _parse_ls_surface_regions(data)
 
     if xyz is None or n_vertices == 0 or link_data is None:
@@ -1068,50 +1219,81 @@ def _build_zone_plan(mesh: dict,
     link_data = mesh["link_data"]
     n_cells = int(link_data["n_cells"])
     cvol_id = mesh.get("cvol_id")
-    parts = mesh.get("parts", [])
+    parts_with_cvol: list[tuple[str, int]] = mesh.get("parts_with_cvol", [])
     regions = mesh.get("volume_regions", [])
-    assembly_map = mesh.get("part_assembly", {})
+    asm_info = mesh.get("assembly_info", {})
+    part_paths: dict[str, Optional[str]] = asm_info.get("part_paths", {}) if isinstance(asm_info, dict) else {}
+    root_empty_prefix: Optional[str] = asm_info.get("root_empty_prefix") if isinstance(asm_info, dict) else None
 
     # CLI override: caller supplied an explicit zone name list.
     if override_zone_names:
         all_mask = np.ones(n_cells, dtype=bool)
         return [(name, all_mask) for name in override_zone_names]
 
-    # Build the ordered zone list.  Volume regions come first (in file
-    # order), followed by parts.  This matches the vendor's output:
-    #
-    #   tr03_orig.cgns Base/ children order =
-    #     Rotate_MovingVolumeRegion, FluidRegion, Rotate_Moving,
-    #     @VPartRegion_Case[2], @VPartRegion_Rotate[2],
-    #     FPHPARTS.tr03.Case, FPHPARTS.Rotate
     plan: list[tuple[str, np.ndarray]] = []
 
-    if not regions and not parts:
+    if not regions and not parts_with_cvol:
         # No partition metadata — fall back to the legacy 2-zone layout.
         all_mask = np.ones(n_cells, dtype=bool)
         plan.append(("FluidRegion", all_mask))
         plan.append(("FPHPARTS.box_vol", all_mask))
         return plan
 
-    # Volume regions (use the names as stored in the GPH file).
+    # 1. Volume regions (file-order, using GPH names verbatim).
     for region in regions:
-        mask = _classify_zone_cells(region, parts, cvol_id, n_cells)
+        mask = _classify_zone_cells(region, parts_with_cvol, cvol_id, n_cells)
         plan.append((region, mask))
 
-    # If LS_VolumeRegions does NOT include "FluidRegion" but a full-mesh
-    # zone is conventional, prepend it so downstream CFD tools always have
-    # an "all cells" view.  In tr03 this entry already exists; in box_ansa
-    # it does too — only synthetic / hand-crafted files would need this.
-    if not any(name == "FluidRegion" for name, _ in plan) and len(parts) > 0:
+    if not any(name == "FluidRegion" for name, _ in plan) and parts_with_cvol:
         plan.insert(0, ("FluidRegion", np.ones(n_cells, dtype=bool)))
 
-    # Parts (each becomes one FPHPARTS.* zone).
-    for idx, part in enumerate(parts, start=1):
-        a_name = assembly_map.get(part)
-        zone_name = (f"FPHPARTS.{a_name}.{part}" if a_name
-                     else f"FPHPARTS.{part}")
-        mask = (cvol_id == idx) if (cvol_id is not None and len(cvol_id) == n_cells) \
-                                 else np.ones(n_cells, dtype=bool)
+    # 2. Parts (each becomes one zone).  Zone naming heuristic:
+    #
+    # Empirical rule observed across the three vendor reference files
+    # (box_ansa, tr03, laptop_simplified_voxel_less):
+    #
+    #   * box_ansa  : 1 part 'box_vol', no assembly nesting
+    #                 → 'FPHPARTS.box_vol'                       (depth 0)
+    #   * tr03      : 'Case' nested in 1 assembly  → 'FPHPARTS.tr03.Case'  (depth 1)
+    #                 'Rotate' at root             → 'FPHPARTS.Rotate'     (depth 0)
+    #   * laptop    : 'air_domain' in 2 assemblies → 'laptop_3d_geom.____.air_domain' (depth 2)
+    #                 'rotation1' at root (+empty-asm prefix 'fan2.fan1')
+    #                                              → 'fan2.fan1.rotation1' (depth 2)
+    #                 'rotation2' likewise         → 'fan2.fan1.rotation2' (depth 2)
+    #
+    # So the rule is:
+    #   * Path depth ≥ 2  → use the full dotted path verbatim
+    #   * Path depth  < 2 → prepend 'FPHPARTS.' to the dotted path
+    #
+    # The "path" of a root-level part is built from
+    # ``root_empty_prefix`` when one was derived (laptop's
+    # ``fan2.fan1``).  Otherwise the path is just the part name.
+    legacy_pa = mesh.get("part_assembly", {})
+
+    def _zone_name_for_part(p: str) -> str:
+        path = part_paths.get(p)
+        if path is None:
+            # Root-level part: synthesize a path using the
+            # empty-assembly prefix (laptop convention) when available.
+            if root_empty_prefix:
+                path = f"{root_empty_prefix}.{p}"
+            else:
+                # Legacy single-component path.
+                a_name = legacy_pa.get(p)
+                path = f"{a_name}.{p}" if a_name else p
+        # Path depth = number of '.'-separated components.  ≥ 3 means
+        # at least 2 ancestor assemblies + the part itself; in that case
+        # the vendor uses the raw path.  Otherwise prepend 'FPHPARTS.'.
+        depth = path.count(".")
+        if depth >= 2:
+            return path
+        return f"FPHPARTS.{path}"
+
+    for part, cvol in parts_with_cvol:
+        zone_name = _zone_name_for_part(part)
+        mask = ((cvol_id == cvol)
+                if (cvol_id is not None and len(cvol_id) == n_cells)
+                else np.ones(n_cells, dtype=bool))
         plan.append((zone_name, mask))
 
     return plan
