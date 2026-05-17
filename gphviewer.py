@@ -67,7 +67,13 @@ except ImportError:
     except ImportError:
         HAS_PYQT = None
 
-from gph_model import GphDocument, GphNode
+from gph_model import (
+    GphDocument,
+    GphNode,
+    parse_ls_links_summary,
+    parse_ls_nodes_vertices,
+    parse_ls_parts,
+)
 
 
 def read_f32_be(data: bytes, pos: int) -> float:
@@ -186,7 +192,31 @@ class GphViewerMain(QMainWindow):
             return
         self._build_tree()
         self.setWindowTitle(f"GPH Viewer - {Path(path).name}")
-        self.statusBar().showMessage(f"Opened: {path} ({len(self.doc._raw_data)} bytes)")
+        summary = self._file_summary(path)
+        self.statusBar().showMessage(
+            f"Opened: {path} ({len(self.doc._raw_data)} bytes) — {summary}"
+        )
+
+    def _file_summary(self, path: str) -> str:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return ""
+        parts = []
+        _, _, nv = parse_ls_nodes_vertices(data)
+        if nv:
+            parts.append(f"{nv} verts")
+        links = parse_ls_links_summary(data)
+        if links:
+            parts.append(f"{links['n_faces']} faces")
+            parts.append(f"{links['n_cells']} cells")
+            if links.get("polyhedral"):
+                parts.append("polyhedral")
+        pmeta = parse_ls_parts(data)
+        if pmeta:
+            parts.append(f"{len(pmeta)} parts")
+        return ", ".join(parts) if parts else "structure only"
 
     def _build_tree(self):
         self.tree.clear()
@@ -236,7 +266,10 @@ class GphViewerMain(QMainWindow):
             "",
         ]
         if node.value is not None:
-            if isinstance(node.value, (list, tuple)):
+            if isinstance(node.value, str) and "\n" in node.value:
+                lines.append("Value:")
+                lines.append(node.value)
+            elif isinstance(node.value, (list, tuple)):
                 if len(node.value) <= 20:
                     lines.append(f"Value: {node.value}")
                 else:
@@ -251,7 +284,13 @@ class GphViewerMain(QMainWindow):
         self._table_loading = True
         if isinstance(node.value, (list, tuple)) and node.value:
             first = node.value[0]
-            if isinstance(first, (int, float)):
+            if isinstance(first, str):
+                self.data_table.setColumnCount(1)
+                self.data_table.setHorizontalHeaderLabels(["Entry"])
+                self.data_table.setRowCount(len(node.value))
+                for i, v in enumerate(node.value):
+                    self.data_table.setItem(i, 0, QTableWidgetItem(str(v)))
+            elif isinstance(first, (int, float)):
                 self.data_table.setColumnCount(1)
                 self.data_table.setHorizontalHeaderLabels(["Value"])
                 self.data_table.setRowCount(len(node.value))
@@ -298,7 +337,9 @@ class GphViewerMain(QMainWindow):
             self.edit_input.setEnabled(True)
             self.edit_input.setText(str(node.value))
             self.apply_btn.setEnabled(True)
-        elif node.data_type in ("I4[135]", "I4[]", "R8[n,3]", "R8[]") and node.value:
+        elif (node.data_type.startswith(("I4[", "R8["))
+              or node.data_type in ("I4[]", "R8[]", "topology", "parts", "regions",
+                                    "surf_regions", "assembly_xml")) and node.value:
             self.edit_input.setEnabled(True)
             self.edit_input.setPlaceholderText("Use Data tab; edit not yet implemented for arrays")
             self.edit_input.clear()
@@ -309,13 +350,10 @@ class GphViewerMain(QMainWindow):
             self.apply_btn.setEnabled(False)
 
     def on_table_cell_changed(self, item: QTableWidgetItem):
-        # Editing LS_Nodes vertex coordinates from the table is intentionally
-        # disabled.  Coordinates are stored in axis-major float64 blocks (X all
-        # together, then Y, then Z) with dialect-dependent encoding (standard
-        # big-endian for ANSA / word-reversed for legacy SCTpre) — patching a
-        # single cell would require recomputing the per-block byte_count
-        # sentinels and choosing the correct encoding for the file at hand,
-        # neither of which is implemented in the viewer.
+        # Vertex / topology / partition arrays are read-only in the viewer.
+        # Coordinates live in three separate float64 axis blocks with optional
+        # word-reversed encoding; LS_Links uses variable-length CSR connectivity
+        # for polyhedral meshes — inline edits are not supported.
         if self._table_loading or not self.current_node:
             return
         # No-op: keep the table read-only for vertex arrays.

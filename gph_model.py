@@ -47,6 +47,294 @@ def _looks_like_coords(values: list) -> bool:
     return True
 
 
+# ── Shared section scanners (aligned with gph2cgns.py) ───────────────────────
+
+_SECTION_BOUNDARY_NAMES = [
+    "FileRevision", "Application", "ApplicationVersion", "ReleaseDate",
+    "GridType", "Dimension", "Bias", "Date", "Comments", "Cycle",
+    "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
+    "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
+    "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
+    "LS_Assemblies", "Element_InformationFlag", "OverlapEnd",
+]
+
+
+def find_section(data: bytes, name: str) -> int:
+    """Return offset of the I4=32 marker before *name*, or -1."""
+    name_padded = name.ljust(32).encode("ascii")
+    idx = data.find(name_padded)
+    if idx < 4:
+        return -1
+    if read_i32_be(data, idx - 4) == 32:
+        return idx - 4
+    return -1
+
+
+def section_end(data: bytes, sec_start: int) -> int:
+    best = len(data)
+    for name in _SECTION_BOUNDARY_NAMES:
+        off = find_section(data, name)
+        if off > sec_start and off < best:
+            best = off
+    return best
+
+
+def iter_data_blocks(data: bytes, sec_start: int, sec_end: int):
+    """Yield ``(payload_start, byte_count)`` for each data block in a section."""
+    pos = sec_start + 40
+    n = len(data)
+    while pos + 8 <= sec_end and pos + 8 <= n:
+        if read_i32_be(data, pos) != 12:
+            pos += 4
+            continue
+        v = read_i32_be(data, pos + 4)
+        if v in (4, 8) and pos + 16 <= sec_end:
+            dim0 = read_i32_be(data, pos + 8)
+            dim1 = read_i32_be(data, pos + 12)
+            if 0 < dim0 < 10_000_000 and 0 < dim1 < 10_000_000:
+                pos += 16
+                continue
+        bc = v
+        if bc <= 0 or pos + 8 + bc + 4 > sec_end:
+            pos += 4
+            continue
+        payload_end = pos + 8 + bc
+        if read_i32_be(data, payload_end) != bc:
+            pos += 4
+            continue
+        yield pos + 8, bc
+        pos = payload_end + 4
+
+
+def parse_ls_nodes_vertices(data: bytes) -> tuple[Optional[list[tuple[float, float, float]]], str, int]:
+    """Parse LS_Nodes → (vertices, dialect_label, n_vertices)."""
+    sec_start = find_section(data, "LS_Nodes")
+    if sec_start < 0:
+        return None, "", 0
+    sec_end = section_end(data, sec_start)
+    blocks = list(iter_data_blocks(data, sec_start, sec_end))
+    f64_blocks = [(p, bc) for p, bc in blocks if bc >= 8 and bc % 8 == 0]
+    if len(f64_blocks) < 3:
+        return None, "", 0
+    sizes = [bc for _, bc in f64_blocks]
+    target = max(set(sizes), key=sizes.count)
+    trio = [(p, bc) for p, bc in f64_blocks if bc == target][:3]
+    if len(trio) < 3:
+        return None, "", 0
+    n_vertices = trio[0][1] // 8
+
+    def _decode(reader):
+        axes: list[list[float]] = []
+        for payload_start, _ in trio:
+            vals = [reader(data, payload_start + i * 8) for i in range(n_vertices)]
+            axes.append(vals)
+        return axes
+
+    def _score(axes):
+        score = 0.0
+        for ax in axes:
+            for v in ax:
+                if not (v == v):  # NaN
+                    score += 1e30
+                    continue
+                a = abs(v)
+                if a != 0.0 and (a > 1e6 or a < 1e-30):
+                    score += a + (1.0 / max(a, 1e-300))
+                else:
+                    score += a
+        return score
+
+    axes_be = _decode(read_f64_be)
+    axes_wr = _decode(read_f64_wr)
+    if _score(axes_be) <= _score(axes_wr):
+        axes, dialect = axes_be, "standard BE float64"
+        col_perm = (0, 1, 2)
+    else:
+        axes, dialect = axes_wr, "word-reversed float64"
+        col_perm = (0, 2, 1)
+    verts = [
+        (axes[col_perm[0]][i], axes[col_perm[1]][i], axes[col_perm[2]][i])
+        for i in range(n_vertices)
+    ]
+    return verts, dialect, n_vertices
+
+
+def parse_ls_links_summary(data: bytes) -> Optional[dict]:
+    """Return a short topology summary dict for LS_Links."""
+    sec_start = find_section(data, "LS_Links")
+    if sec_start < 0:
+        return None
+    sec_end = section_end(data, sec_start)
+    blocks = [(p, bc) for p, bc in iter_data_blocks(data, sec_start, sec_end) if bc > 0]
+    if not blocks:
+        return None
+    from collections import Counter
+    block_sizes = [bc for _, bc in blocks]
+    n_faces_block_size = None
+    for size, count in Counter(block_sizes).most_common():
+        if count >= 3 and size % 4 == 0 and size >= 4:
+            n_faces_block_size = size
+            break
+    if n_faces_block_size is None:
+        return None
+    n_faces = n_faces_block_size // 4
+    triples = [b for b in blocks if b[1] == n_faces_block_size][:3]
+    if len(triples) < 3:
+        return None
+    npe_p, _ = triples[2]
+    npe = [read_i32_be(data, npe_p + i * 4) for i in range(n_faces)]
+    conn_total = sum(npe)
+    boundary = 0
+    BNDRY = 0xFFFFFFFF
+    neigh_p, _ = triples[1]
+    for i in range(n_faces):
+        raw = data[neigh_p + i * 4 : neigh_p + i * 4 + 4]
+        if int.from_bytes(raw, "big") == BNDRY:
+            boundary += 1
+    owner_p, _ = triples[0]
+    max_own = max(read_i32_be(data, owner_p + i * 4) for i in range(n_faces))
+    n_cells = max_own + 1
+    return {
+        "n_faces": n_faces,
+        "n_cells": n_cells,
+        "boundary_faces": boundary,
+        "npe_min": min(npe),
+        "npe_max": max(npe),
+        "conn_entries": conn_total,
+        "polyhedral": max(npe) > 3 if npe else False,
+    }
+
+
+def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
+    """Parse LS_Parts → [(part_name, cvol_id), ...] (see gph2cgns)."""
+    sec_start = find_section(data, "LS_Parts")
+    if sec_start < 0:
+        return []
+    sec_end = section_end(data, sec_start)
+    name_blocks: list[tuple[str, int, int]] = []
+    for p, bc in iter_data_blocks(data, sec_start, sec_end):
+        if bc != 255:
+            continue
+        raw = data[p : p + bc]
+        if not all(b == 0 or 32 <= b < 127 for b in raw):
+            continue
+        name = raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+        if not name or not any(c.isalpha() for c in name):
+            continue
+        name_blocks.append((name, p - 8, p + bc + 4))
+    out: list[tuple[str, int]] = []
+    for i, (name, _, after_trailer) in enumerate(name_blocks):
+        scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
+        cvol_id: Optional[int] = None
+        pos = after_trailer
+        while pos + 16 <= scan_end:
+            if (read_i32_be(data, pos) == 12
+                    and read_i32_be(data, pos + 4) == 4
+                    and read_i32_be(data, pos + 12) == 4):
+                cvol_id = read_i32_be(data, pos + 8)
+            pos += 4
+        if cvol_id is not None:
+            out.append((name, int(cvol_id)))
+    return out
+
+
+def parse_ls_string_list(data: bytes, section_name: str) -> list[str]:
+    sec_start = find_section(data, section_name)
+    if sec_start < 0:
+        return []
+    sec_end = section_end(data, sec_start)
+    out: list[str] = []
+    for p, bc in iter_data_blocks(data, sec_start, sec_end):
+        raw = data[p : p + bc]
+        if all(b == 0 or 32 <= b < 127 for b in raw):
+            s = raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+            if s:
+                out.append(s)
+    return out
+
+
+def parse_ls_surface_regions_summary(data: bytes) -> list[tuple[str, int]]:
+    sec_start = find_section(data, "LS_SurfaceRegions")
+    if sec_start < 0:
+        return []
+    sec_end = section_end(data, sec_start)
+    blocks = list(iter_data_blocks(data, sec_start, sec_end))
+    out: list[tuple[str, int]] = []
+    i = 0
+    while i + 2 < len(blocks):
+        p_n, bc_n = blocks[i]
+        p_i, bc_i = blocks[i + 1]
+        p_w, bc_w = blocks[i + 2]
+        name_raw = data[p_n : p_n + bc_n]
+        if not all(b == 0 or 32 <= b < 127 for b in name_raw):
+            i += 1
+            continue
+        name = name_raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+        if not name:
+            i += 1
+            continue
+        if bc_i > 0 and bc_i == bc_w and bc_i % 4 == 0:
+            out.append((name, bc_i // 4))
+            i += 3
+        else:
+            i += 1
+    return out
+
+
+def parse_ls_assemblies_summary(data: bytes) -> dict:
+    sec_start = find_section(data, "LS_Assemblies")
+    empty = {"has_assemblies": False, "root_empty_prefix": None, "part_paths": {}}
+    if sec_start < 0:
+        return empty
+    sec_end = section_end(data, sec_start)
+    xml_bytes = b""
+    for p, bc in iter_data_blocks(data, sec_start, sec_end):
+        chunk = data[p : p + bc]
+        if chunk.lstrip().startswith(b"<?xml") or b"<part" in chunk:
+            xml_bytes = chunk
+            break
+    if not xml_bytes:
+        return empty
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return empty
+    part_paths: dict[str, Optional[str]] = {}
+    has_assemblies = any(True for _ in root.iter("assembly"))
+
+    def _walk(node, ancestors: list[str]):
+        for child in node:
+            if child.tag == "assembly":
+                aname = child.get("name", "")
+                _walk(child, ancestors + [aname] if aname else ancestors)
+            elif child.tag == "part":
+                pname = child.get("name", "")
+                if pname:
+                    part_paths[pname] = ".".join(ancestors + [pname]) if ancestors else None
+
+    _walk(root, [])
+    root_parts_count = sum(1 for part in root.findall("part") if part.get("name"))
+    root_empty_prefix: Optional[str] = None
+    if root_parts_count > 0:
+        top_asm = next(iter(root.findall("assembly")), None)
+        if top_asm is not None:
+            empty_asm_names: list[str] = []
+            for child in top_asm.findall("assembly"):
+                if (len(child.findall("assembly")) == 0
+                        and len(child.findall("part")) == 0):
+                    name = child.get("name", "")
+                    if name:
+                        empty_asm_names.append(name)
+            if len(empty_asm_names) >= root_parts_count:
+                root_empty_prefix = ".".join(empty_asm_names[:root_parts_count])
+    return {
+        "has_assemblies": has_assemblies,
+        "root_empty_prefix": root_empty_prefix,
+        "part_paths": part_paths,
+    }
+
+
 @dataclass
 class GphNode:
     """A node in the GPH tree - can represent a section or a data item."""
@@ -103,28 +391,7 @@ class GphDocument:
         # 32-byte ASCII (space-padded) label.  We scan for those labels to
         # build a section layout that adapts to any file size (the legacy
         # ``box.gph`` and the new ``box_ansa.gph`` differ by ~13 kB).
-        candidate_names = [
-            "FileRevision",
-            "Application",
-            "ApplicationVersion",
-            "ReleaseDate",
-            "GridType",
-            "Dimension",
-            "Bias",
-            "Date",
-            "Comments",
-            "Cycle",
-            "Unused",
-            "Encoding",
-            "HeaderDataEnd",
-            "OverlapStart_0",
-            "LS_CvolIdOfElements",
-            "LS_Links",
-            "LS_Nodes",
-            "LS_SurfaceRegions",
-            "Element_InformationFlag",
-            "OverlapEnd",
-        ]
+        candidate_names = _SECTION_BOUNDARY_NAMES
         found = []  # list of (offset, name)
         for name in candidate_names:
             padded = name.ljust(32).encode("ascii")
@@ -167,103 +434,70 @@ class GphDocument:
             v = read_i32_be(raw, 64) if len(raw) > 64 else 0
             return GphNode(name, offset, len(raw), "I4", value=v, raw=raw, children=[])
 
+        file_data = bytes(self._raw_data)
+
         if name == "LS_CvolIdOfElements":
-            # Locate the [12, type=4, dim0=n_elements, dim1=1] descriptor by
-            # scanning forward from the label header; the data follows after a
-            # 12-byte block header (legacy) or 8-byte block header (modern).
             arr = self._read_i4_array_after_label(raw)
-            type_str = f"I4[{len(arr)}]" if arr is not None else "I4[]"
-            return GphNode(name, offset, len(raw), type_str,
+            unique_cv = sorted(set(arr)) if arr else []
+            summary = (
+                f"I4[{len(arr)}] cvol_ids={unique_cv[:12]}"
+                f"{'...' if len(unique_cv) > 12 else ''}"
+                if arr is not None else "I4[]"
+            )
+            return GphNode(name, offset, len(raw), summary,
                            value=arr, raw=raw, children=[])
 
         if name == "LS_Nodes":
-            # Coordinates are stored as three float64 axis blocks.  All
-            # observed GPH files (legacy box.gph as well as the modern
-            # ANSA / scFLOW box_ansa.gph) use the same on-disk encoding:
-            #
-            #   [16B descriptor: 12 / 8 / n_verts / 1]
-            #   [8B  data header: 12 / byte_count]
-            #   [n_verts × 8B] standard big-endian IEEE-754 float64
-            #   [4B trailer: byte_count]
-            #
-            # axis order in the file is X, Y, Z.  A word-reversed reading with
-            # a 12-byte data header is kept as defensive fallback for any
-            # hypothetical GPH variant that might use the legacy mid-endian
-            # encoding (none has been observed in practice — the historical
-            # "word-reversed" theory was an off-by-4 alignment artifact).
-            pos = 40  # skip 40B label-header
-            n_vertices = 0
-            while pos + 16 <= len(raw):
-                if read_i32_be(raw, pos) != 12:
-                    break
-                tc = read_i32_be(raw, pos + 4)
-                d0 = read_i32_be(raw, pos + 8)
-                d1 = read_i32_be(raw, pos + 12)
-                pos += 16
-                if tc == 8 and d1 == 1 and d0 > 0:
-                    n_vertices = d0
-                    break
-
-            def _read_axis_blocks(data_header_size: int, reader) -> list[list[float]]:
-                """Return [X_vals, ?, ?] for the three coordinate blocks."""
-                p = pos
-                axes: list[list[float]] = []
-                for _ in range(3):
-                    if p + data_header_size > len(raw):
-                        break
-                    p += data_header_size
-                    vals = []
-                    for _ in range(n_vertices):
-                        if p + 8 > len(raw):
-                            break
-                        vals.append(reader(raw, p))
-                        p += 8
-                    axes.append(vals)
-                    # Skip the 4-byte trailing sentinel (8-byte-header dialect)
-                    # or the 16-byte inter-block descriptor (12-byte-header dialect).
-                    if data_header_size == 8 and p + 4 <= len(raw):
-                        p += 4
-                    if p + 16 <= len(raw) and read_i32_be(raw, p) == 12:
-                        p += 16
-                return axes
-
-            if n_vertices > 0:
-                # Try the modern 8-byte-header / standard BE float64 dialect first.
-                axes_new = _read_axis_blocks(8, read_f64_be)
-                axes_old = _read_axis_blocks(12, read_f64_wr)
-                if (len(axes_new) == 3
-                        and all(_looks_like_coords(a) for a in axes_new)):
-                    # ANSA dialect: file order X, Y, Z.
-                    axis_vals, swap_zy = axes_new, False
-                else:
-                    # Legacy SCTpre dialect: file order X, Z, Y → swap.
-                    axis_vals, swap_zy = axes_old, True
-                if len(axis_vals) == 3:
-                    if swap_zy:
-                        verts = [
-                            (axis_vals[0][i], axis_vals[2][i], axis_vals[1][i])
-                            for i in range(n_vertices)
-                        ]
-                    else:
-                        verts = [
-                            (axis_vals[0][i], axis_vals[1][i], axis_vals[2][i])
-                            for i in range(n_vertices)
-                        ]
-                    return GphNode(
-                        name, offset, len(raw), "R8[n,3]",
-                        value=verts, raw=raw, children=[],
-                    )
+            verts, dialect, n_vertices = parse_ls_nodes_vertices(file_data)
+            if verts and n_vertices:
+                dtype = f"R8[{n_vertices},3] ({dialect})"
+                return GphNode(name, offset, len(raw), dtype,
+                               value=verts, raw=raw, children=[])
             return GphNode(name, offset, len(raw), "R8[]", value=None, raw=raw, children=[])
 
         if name == "LS_Links":
-            # Concatenate every data block (owner / neighbor / npe / [face_type]
-            # / conn) by scanning the section with the same data-block pattern
-            # used by gph2cgns.  Returns a flat I4 array preview for the
-            # viewer's Data tab.
+            summary = parse_ls_links_summary(file_data)
+            if summary:
+                val = (
+                    f"faces={summary['n_faces']} cells={summary['n_cells']} "
+                    f"BC={summary['boundary_faces']} "
+                    f"npe=[{summary['npe_min']}..{summary['npe_max']}]"
+                    + (" polyhedral" if summary["polyhedral"] else "")
+                )
+                return GphNode(name, offset, len(raw), "topology", value=val,
+                               raw=raw, children=[])
             arr = self._collect_data_blocks_i4(raw)
             type_str = f"I4[{len(arr)}]" if arr is not None else "I4[]"
             return GphNode(name, offset, len(raw), type_str,
                            value=arr, raw=raw, children=[])
+
+        if name == "LS_Parts":
+            parts = parse_ls_parts(file_data)
+            val = [f"{p} (cvol_id={cv})" for p, cv in parts]
+            return GphNode(name, offset, len(raw),
+                           f"parts[{len(parts)}]", value=val, raw=raw, children=[])
+
+        if name == "LS_VolumeRegions":
+            regions = parse_ls_string_list(file_data, "LS_VolumeRegions")
+            return GphNode(name, offset, len(raw),
+                           f"regions[{len(regions)}]", value=regions, raw=raw, children=[])
+
+        if name == "LS_SurfaceRegions":
+            regions = parse_ls_surface_regions_summary(file_data)
+            val = [f"{n} ({nf} faces)" for n, nf in regions]
+            return GphNode(name, offset, len(raw),
+                           f"surf_regions[{len(regions)}]", value=val, raw=raw, children=[])
+
+        if name == "LS_Assemblies":
+            asm = parse_ls_assemblies_summary(file_data)
+            lines = []
+            if asm["root_empty_prefix"]:
+                lines.append(f"root_empty_prefix={asm['root_empty_prefix']}")
+            for pname, path in asm["part_paths"].items():
+                lines.append(f"{pname} -> {path or '(root)'}")
+            return GphNode(name, offset, len(raw), "assembly_xml",
+                           value="\n".join(lines) if lines else "(no XML)",
+                           raw=raw, children=[])
 
         return GphNode(name, offset, len(raw), "raw", value=desc, raw=raw, children=[])
 

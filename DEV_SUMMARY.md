@@ -11,6 +11,7 @@
 7. [经验总结](#7-经验总结)
 8. [第三阶段：ANSA 方言适配 + FLDUTIL 输出对齐](#8-第三阶段ansa-方言适配--fldutil-输出对齐)
 9. [第四阶段：HDF5 superblock 版本与 ANSA 兼容性](#9-第四阶段hdf5-superblock-版本与-ansa-兼容性)
+10. [第五阶段：多 Zone 分区、多面体网格与命名 BC](#10-第五阶段多-zone-分区多面体网格与命名-bc)
 
 ---
 
@@ -578,4 +579,88 @@ box_ansa_orig.cgns (vendor)   : 35 448 B  superblock=0  OHDR=0   SNOD/TREE/HEAP=
 |------|------|
 | `gph2cgns.py` | 把 `h5py.File(..., libver=("v108","v108"))` 改回 `libver=("earliest","v108")`；更新模块级注释解释 superblock 版本选择 |
 | `DEV_SUMMARY.md` | 本节（第四阶段） |
-| `GPH_FORMAT_SPEC.md` | 新增"CGNS 输出 HDF5 格式约束"章节
+| `GPH_FORMAT_SPEC.md` | 新增"CGNS 输出 HDF5 格式约束"章节 |
+
+---
+
+## 10. 第五阶段：多 Zone 分区、多面体网格与命名 BC
+
+### 10.1 新能力概览
+
+在 ANSA / HDF5 superblock 对齐之后，`gph2cgns.py` 又扩展了三类能力，并同步到 `gph_model.py`、`gph_parser.py`、`gphviewer.py` 与格式文档：
+
+| 能力 | GPH 来源 | CGNS 输出 |
+|------|----------|-----------|
+| **多 Zone 分区** | `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies` | 每个区域/Part 一个 `Zone_t` 子网格 |
+| **多面体网格** | `LS_Links` 可变 `npe` + CSR `conn` | `NGON_n` 变长面 + `NFACE_n` |
+| **命名边界条件** | `LS_SurfaceRegions` | 每 Zone 下多个 `BC_t` 族（空 PointList 亦保留）|
+
+测试样例：`tr03.gph`（6 万+ 四面体/多面体混合）、`laptop_simplified_voxel_less.gph`（三 Part + 空 assembly 前缀）。
+
+### 10.2 多 Zone 分区与 Zone 命名
+
+**体区域**：`LS_VolumeRegions` 中的 ASCII 名按文件顺序各生成一个 Zone（如 `FluidRegion`、`Rotate_MovingVolumeRegion`），cell 归属由名称与 `LS_CvolIdOfElements` 启发式匹配。
+
+**Part 区域**：`LS_Parts` 中每个 Part 再生成一个 Zone。命名规则（与 FLDUTIL 参考对齐）：
+
+| 样例文件 | Part | 生成的 Zone 名 |
+|----------|------|----------------|
+| `box_ansa.gph` | `box_vol` | `FPHPARTS.box_vol` |
+| `tr03.gph` | `Case`（嵌套 1 层 assembly） | `FPHPARTS.tr03.Case` |
+| `tr03.gph` | `Rotate`（根级） | `FPHPARTS.Rotate` |
+| `laptop_*.gph` | `air_domain`（深度 2） | `laptop_3d_geom.____.air_domain` |
+| `laptop_*.gph` | `rotation1`（根级 + 空前缀） | `fan2.fan1.rotation1` |
+
+`LS_Assemblies` XML 提供 `part_paths`；对根级 Part 若存在与根 part 数量相同的**空** `<assembly>` 兄弟，其名称拼接为 `root_empty_prefix`（laptop 的 `fan2.fan1`）。
+
+### 10.3 cvol_id ↔ Part 映射修复（#13）
+
+**问题**：`laptop_simplified_voxel_less.gph` 转换后 `rotation1` / `rotation2` Zone 为 **0 单元**，ANSA 无法使用。
+
+**根因**：曾错误假定 `LS_CvolIdOfElements[i]` 等于 Part 在 `LS_Parts` 列表中的 1-based 序号。实际上 cvol_id 是写在每个 Part 名块**之后**的描述符 `[12, 4, cvol_id, 4]` 中的不透明 ID：
+
+- `tr03`：Part 顺序与 cvol_id `{1,2}` 巧合一致  
+- `laptop`：Part 列表顺序对应 cvol_id **`{1, 9, 11}`**，而非 `{1, 2, 3}`
+
+**修复**：`_parse_ls_parts_with_cvol_ids()` 扫描每个 255 字节名块后的最后一个 `[12,4,X,4]` 描述符；Zone cell 掩码改为 `cvol_id == X`。
+
+### 10.4 多面体（混合单元）网格
+
+`LS_Links` 的 `npe` 数组不再假定全为 3。`tr03.gph` 中面节点数为 3–11 不等；连通性按 **CSR** 存储：
+
+```
+face_offsets[i+1] = face_offsets[i] + npe[i]
+face i 的节点 = conn[face_offsets[i] : face_offsets[i+1]]
+```
+
+`gph2cgns` 写 CGNS 时使用 `ElementStartOffset` + 扁平 `ElementConnectivity`（NGON_n），NFACE_n 仍用带符号面 ID（owner 正 / neighbor 负）。
+
+### 10.5 命名 BC（`LS_SurfaceRegions`，#12）
+
+每个表面区域 = 三个连续块：`name` | `face_ids[]` | `weights[]`（0-based 全局面号）。
+
+对每个 CGNS Zone：
+
+- 将全局 face id 映射到 zone 局部 1-based 面号  
+- 每个区域名一个 `BC_t`，`GridLocation=FaceCenter`，值为 `"Null"`（FLDUTIL 约定）  
+- 该 zone 不含此区域的面时，仍保留 `BC_t` 组但**不写** `PointList/ data`（与 `tr03_orig.cgns` 一致）
+
+`tr03` 每 zone 约 15 个 BC 族（`inlet`、`outlet`、`Rotate_Plane`、`*_Moving`/`*_Static` 等）。
+
+### 10.6 配套工具与文档同步
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph_model.py` | 通用块扫描器；`LS_Parts`/`LS_VolumeRegions`/`LS_Assemblies`/`LS_SurfaceRegions` 解析；`LS_Nodes`/`LS_Links` 与 gph2cgns 对齐 |
+| `gph_parser.py` | 动态节布局；mesh/partition 摘要输出；更新 `format_description()` |
+| `gphviewer.py` | 树中显示新节；状态栏 mesh 摘要；分区/拓扑只读 |
+| `GPH_FORMAT_SPEC.md` | §5.1–5.7 分区节；§6 多 Zone CGNS；§9 HDF5 约束 |
+| `DEV_SUMMARY.md` | 本节 |
+
+**相关提交**（main 分支近期）：
+
+```
+f93f997  fix(gph2cgns): correct cvol_id ↔ part mapping (#13)
+e56e6d7  feat(gph2cgns): multi-zone partitioning + polyhedral mesh (#11)
+dcc8bce  feat(gph2cgns): per-zone named BC families from LS_SurfaceRegions (#12)
+```

@@ -2,23 +2,23 @@
 """
 GPH (Geometry/Polyhedron) Binary Format Parser and Reverse-Engineered Format Describer.
 
-Parses box.gph and outputs a structured format description.
+Parses any .gph file and outputs a structured format description.
 Byte order: Big-Endian for all multi-byte integers and metadata.
 """
 
-import struct
 import sys
 from pathlib import Path
 
-
-def read_i32_be(data: bytes, pos: int) -> int:
-    """Read 4-byte big-endian integer."""
-    return int.from_bytes(data[pos : pos + 4], "big")
-
-
-def read_f32_be(data: bytes, pos: int) -> float:
-    """Read 4-byte big-endian float."""
-    return struct.unpack(">f", data[pos : pos + 4])[0]
+from gph_model import (
+    find_section,
+    parse_ls_assemblies_summary,
+    parse_ls_links_summary,
+    parse_ls_nodes_vertices,
+    parse_ls_parts,
+    parse_ls_string_list,
+    parse_ls_surface_regions_summary,
+    read_i32_be,
+)
 
 
 def parse_gph(filepath: str) -> dict:
@@ -32,237 +32,107 @@ def parse_gph(filepath: str) -> dict:
         "sections": [],
         "header": {},
         "data_arrays": {},
+        "mesh_summary": {},
+        "partition": {},
     }
-
-    pos = 0
 
     # --- File header ---
     rec0_len = read_i32_be(data, 0)
     rec0_data = data[4 : 4 + rec0_len].decode("ascii", errors="replace")
-    result["header"]["format_id"] = rec0_data  # "CRDL-FLD"
-    pos = 4 + rec0_len
-
-    # --- Initial dimensions (often 4,4,4) ---
-    v1 = read_i32_be(data, pos)
-    v2 = read_i32_be(data, pos + 4)
-    v3 = read_i32_be(data, pos + 8)
+    result["header"]["format_id"] = rec0_data
+    v1 = read_i32_be(data, rec0_len + 4)
+    v2 = read_i32_be(data, rec0_len + 8)
+    v3 = read_i32_be(data, rec0_len + 12)
     result["header"]["dims"] = [v1, v2, v3]
-    pos += 12
 
-    # --- Named fields: pattern [0x20][32-char name][0x20][payload] ---
-    FIELD_NAMES = [
-        "FileRevision",
-        "Application",
-        "ApplicationVersion",
-        "ReleaseDate",
-        "GridType",
-        "Dimension",
-        "Bias",
-        "Date",
-        "Comments",
-        "Cycle",
-        "Unused",
-        "Encoding",
-        "UTF-8",
-        "HeaderDataEnd",
-        "OverlapStart_0",
-        "LS_CvolIdOfElements",
-        "LS_Links",
-        "LS_Nodes",
-        "LS_SurfaceRegions",
-        "Element_InformationFlag",
-        "OverlapEnd",
+    # --- Dynamic section layout ---
+    section_names = [
+        "FileRevision", "Application", "ApplicationVersion", "ReleaseDate",
+        "GridType", "Dimension", "Bias", "Date", "Comments", "Cycle",
+        "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
+        "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
+        "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
+        "LS_Assemblies", "Element_InformationFlag", "OverlapEnd",
     ]
+    found = []
+    for name in section_names:
+        off = find_section(data, name)
+        if off >= 0:
+            found.append((off, name))
+    found.sort(key=lambda x: x[0])
 
-    # Locate fields by scanning for 32-byte blocks with known names
-    def find_field(name: str):
-        name_padded = name.ljust(32).encode("ascii")
-        idx = data.find(name_padded)
-        return idx - 4 if idx >= 4 and read_i32_be(data, idx - 4) == 32 else None
+    first_off = found[0][0] if found else len(data)
+    layout = [(0, first_off, "file_header", "CRDL-FLD identifier + dims")]
+    for i, (off, name) in enumerate(found):
+        end = found[i + 1][0] if i + 1 < len(found) else len(data)
+        layout.append((off, end, name, ""))
 
-    # Parse scalar/metadata fields
-    scalar_values = {}
-    for name in [
-        "FileRevision",
-        "Application",
-        "ApplicationVersion",
-        "ReleaseDate",
-        "GridType",
-        "Dimension",
-        "Bias",
-        "Date",
-        "Cycle",
-        "Encoding",
-    ]:
-        name_pos = find_field(name)
-        if name_pos and name_pos > 0:
-            # Value typically 36 bytes after name start (skip 0x20 + name + 0x20 + 12-byte descriptor)
-            val_pos = name_pos + 4 + 32 + 4 + 12 + 8  # heuristic
-            if val_pos + 4 <= len(data):
-                scalar_values[name] = read_i32_be(data, val_pos)
+    for start, end, name, desc in layout:
+        result["sections"].append({
+            "offset_hex": f"0x{start:04X}",
+            "end_hex": f"0x{end:04X}",
+            "size": end - start,
+            "name": name,
+            "description": desc or _section_blurb(name),
+        })
 
-    # Extract string values by heuristics
-    str_fields = {}
-    app_pos = find_field("Application")
-    if app_pos:
-        # "SCTpre" appears at 0xb8 in earlier dump
-        s = data[0xB4 : 0xB4 + 8].decode("ascii", errors="replace").strip()
-        if s:
-            str_fields["Application"] = s
+    # --- Mesh / partition samples ---
+    verts, dialect, n_verts = parse_ls_nodes_vertices(data)
+    if verts:
+        result["data_arrays"]["LS_Nodes_count"] = n_verts
+        result["data_arrays"]["LS_Nodes_dialect"] = dialect
+        result["data_arrays"]["LS_Nodes_sample"] = verts[:3]
 
-    result["header"]["scalar_metadata"] = scalar_values
-    result["header"]["string_fields"] = str_fields
+    links = parse_ls_links_summary(data)
+    if links:
+        result["mesh_summary"] = links
 
-    # --- Section layout (from reverse engineering) ---
-    sections = [
-        (0x0000, 0x001c, "file_header", "CRDL-FLD identifier + dims"),
-        (0x001c, 0x0078, "FileRevision", "I4 scalar, e.g. 2025"),
-        (0x0078, 0x00d8, "Application", "C1[8] e.g. SCTpre"),
-        (0x00d8, 0x0134, "ApplicationVersion", "I4"),
-        (0x0134, 0x0190, "ReleaseDate", "string/date"),
-        (0x0190, 0x01ec, "GridType", "string"),
-        (0x01ec, 0x0248, "Dimension", "I4"),
-        (0x0248, 0x02a4, "Bias", "I4"),
-        (0x02a4, 0x0300, "Date", "string"),
-        (0x0300, 0x03a8, "Comments", "string"),
-        (0x03a8, 0x04e0, "Cycle", "I4 + Unit"),
-        (0x04e0, 0x0560, "Unused", "reserved"),
-        (0x0560, 0x05d8, "Encoding", "e.g. UTF-8"),
-        (0x05d8, 0x0600, "HeaderDataEnd", "marker"),
-        (0x0600, 0x0628, "OverlapStart_0", "overlap marker"),
-        (0x0628, 0x08dc, "LS_CvolIdOfElements", "I4[135] control volume IDs"),
-        (0x08dc, 0x26b0, "LS_Links", "I4[] link/connectivity pairs"),
-        (0x26b0, 0x2c60, "LS_Nodes", "R8[n,3] vertex coords (word-reversed float64, 3 axis blocks)"),
-        (0x2c60, 0x42b0, "LS_SurfaceRegions", "surface region data"),
-        (0x42b0, 0x45a4, "Element_InformationFlag", "element flags"),
-        (0x45a4, len(data), "OverlapEnd", "trailer"),
-    ]
+    parts = parse_ls_parts(data)
+    if parts:
+        result["partition"]["LS_Parts"] = parts
 
-    for start, end, name, desc in sections:
-        result["sections"].append(
-            {
-                "offset_hex": f"0x{start:04X}",
-                "end_hex": f"0x{end:04X}",
-                "size": end - start,
-                "name": name,
-                "description": desc,
-            }
-        )
+    regions = parse_ls_string_list(data, "LS_VolumeRegions")
+    if regions:
+        result["partition"]["LS_VolumeRegions"] = regions
 
-    # --- Data array extraction for validation ---
-    # LS_CvolIdOfElements: n x I4, located dynamically
-    # Structure: 40B label-header + 5×16B descriptors + 12B data-header + n×4B data
-    cv_sec = b"LS_CvolIdOfElements" + b" " * 13  # 32 chars total
-    cv_idx = data.find(cv_sec)
-    if cv_idx >= 4 and read_i32_be(data, cv_idx - 4) == 32:
-        cv_pos = cv_idx - 4 + 40  # skip section header
-        # Skip 5 descriptors (each 16B) to find the one with dim0 = n_elements
-        n_cv = 0
-        for _ in range(10):
-            if cv_pos + 16 > len(data) or read_i32_be(data, cv_pos) != 12:
+    surf = parse_ls_surface_regions_summary(data)
+    if surf:
+        result["partition"]["LS_SurfaceRegions"] = surf
+
+    asm = parse_ls_assemblies_summary(data)
+    if asm.get("part_paths") or asm.get("root_empty_prefix"):
+        result["partition"]["LS_Assemblies"] = asm
+
+    cv_sec = find_section(data, "LS_CvolIdOfElements")
+    if cv_sec >= 0:
+        from gph_model import iter_data_blocks, section_end
+        sec_end = section_end(data, cv_sec)
+        for p, bc in iter_data_blocks(data, cv_sec, sec_end):
+            if bc % 4 == 0 and bc >= 4:
+                n_cv = bc // 4
+                sample = [read_i32_be(data, p + i * 4) for i in range(min(10, n_cv))]
+                result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
+                result["data_arrays"]["LS_CvolIdOfElements_sample"] = sample
+                unique = sorted({read_i32_be(data, p + i * 4) for i in range(n_cv)})
+                result["data_arrays"]["LS_CvolIdOfElements_unique"] = unique[:20]
                 break
-            d0 = read_i32_be(data, cv_pos + 8)
-            d1 = read_i32_be(data, cv_pos + 12)
-            cv_pos += 16
-            if d1 == 1 and d0 > 1:
-                n_cv = d0
-                break
-        if n_cv > 0:
-            cv_pos += 12  # skip 12B data header
-            arr = [read_i32_be(data, cv_pos + i * 4) for i in range(min(n_cv, 10))]
-            result["data_arrays"]["LS_CvolIdOfElements_sample"] = arr
-            result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
-
-    # LS_Nodes: vertex coordinates stored as three separate float64 axis blocks.
-    # All observed GPH files use a single on-disk encoding:
-    #
-    #   [16B descriptor: 12 / 8 / n_verts / 1]
-    #   [8B  data header: 12 / byte_count]
-    #   [n_verts × 8B] standard big-endian IEEE-754 float64
-    #   [4B trailer: byte_count]
-    #
-    # axis order in the file is X, Y, Z.  A word-reversed reading with a
-    # 12-byte data header is kept as defensive fallback for hypothetical
-    # mid-endian GPH variants — none has been observed in practice.
-    nodes_label = b"LS_Nodes" + b" " * 24
-    nodes_idx = data.find(nodes_label)
-    if nodes_idx >= 4:
-        pos = nodes_idx - 4 + 40  # skip [I4=32][32B name][I4=32]
-        n_nodes = 0
-        while pos + 16 <= len(data):
-            if int.from_bytes(data[pos:pos+4], "big") != 12:
-                break
-            tc = int.from_bytes(data[pos+4:pos+8], "big")
-            d0 = int.from_bytes(data[pos+8:pos+12], "big")
-            d1 = int.from_bytes(data[pos+12:pos+16], "big")
-            pos += 16
-            if tc == 8 and d1 == 1 and d0 > 0:
-                n_nodes = d0
-                break
-        if n_nodes > 0:
-            def _read_axes(data_header_size: int, reader):
-                p = pos
-                axes = []
-                for _ in range(3):
-                    if p + data_header_size > len(data):
-                        break
-                    p += data_header_size
-                    vals = []
-                    for _ in range(n_nodes):
-                        if p + 8 > len(data):
-                            break
-                        vals.append(reader(p))
-                        p += 8
-                    axes.append(vals)
-                    if data_header_size == 8 and p + 4 <= len(data):
-                        p += 4
-                    if p + 16 <= len(data) and int.from_bytes(data[p:p+4], "big") == 12:
-                        p += 16
-                return axes
-
-            def _r_be(p):
-                return struct.unpack(">d", data[p:p+8])[0]
-
-            def _r_wr(p):
-                lower = int.from_bytes(data[p:p+4], "big")
-                upper = int.from_bytes(data[p+4:p+8], "big")
-                return struct.unpack(">d", ((upper << 32) | lower).to_bytes(8, "big"))[0]
-
-            def _looks_like_coords(values):
-                import math
-                if not values:
-                    return False
-                for v in values:
-                    if not math.isfinite(v):
-                        return False
-                    a = abs(v)
-                    if a != 0.0 and (a > 1e6 or a < 1e-30):
-                        return False
-                return True
-
-            axes_new = _read_axes(8, _r_be)
-            axes_old = _read_axes(12, _r_wr)
-            if len(axes_new) == 3 and all(_looks_like_coords(a) for a in axes_new):
-                axis_vals, dialect = axes_new, "standard BE float64 (8B header)"
-                col_perm = (0, 1, 2)  # file order X, Y, Z
-            elif len(axes_old) == 3:
-                axis_vals, dialect = axes_old, "word-reversed float64 (12B header, fallback)"
-                col_perm = (0, 2, 1)  # file order X, Z, Y → output X, Y, Z
-            else:
-                axis_vals, dialect, col_perm = [], None, None
-            if len(axis_vals) == 3:
-                sample = []
-                for i in range(min(3, n_nodes)):
-                    sample.append(
-                        (axis_vals[col_perm[0]][i],
-                         axis_vals[col_perm[1]][i],
-                         axis_vals[col_perm[2]][i]),
-                    )
-                result["data_arrays"]["LS_Nodes_sample"] = sample
-                result["data_arrays"]["LS_Nodes_count"] = n_nodes
-                result["data_arrays"]["LS_Nodes_dialect"] = dialect
 
     return result
+
+
+def _section_blurb(name: str) -> str:
+    blurbs = {
+        "LS_CvolIdOfElements": "I4[n_cells] per-cell cvol_id (opaque Part id, not list index)",
+        "LS_Links": "face topology: owner, neighbor, npe, conn (polyhedral CSR)",
+        "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
+        "LS_SurfaceRegions": "named BC regions -> global face id lists",
+        "LS_VolumeRegions": "volume region names (-> CGNS zones)",
+        "LS_Parts": "part names + cvol_id descriptors",
+        "LS_Assemblies": "XML assembly tree for zone naming",
+        "LS_SolverUnusedRegions": "solver-internal region names",
+        "Element_InformationFlag": "per-element flags",
+    }
+    return blurbs.get(name, "")
 
 
 def format_description() -> str:
@@ -274,107 +144,74 @@ def format_description() -> str:
 
 1. OVERVIEW
 -----------
-  GPH appears to be a geometry/polyhedron mesh file format, likely from SCTpre
-  or a CGNS-related CFD tool. The magic identifier is "CRDL-FLD" (8 bytes).
+  GPH is a geometry/polyhedron mesh file from Software Cradle scFLOW / SCTpre
+  (and ANSA export pipelines).  Magic identifier: "CRDL-FLD" (8 bytes).
   Byte order: BIG-ENDIAN for all integers and floats.
 
-2. FILE STRUCTURE
------------------
+2. FILE STRUCTURE (logical order)
+---------------------------------
+  Sections are located dynamically by scanning for 32-byte ASCII labels
+  preceded by [I4=32].  Typical order:
 
-  +------------------+----------------------------------------------------------+
-  | Offset           | Content                                                  |
-  +------------------+----------------------------------------------------------+
-  | 0x0000 - 0x001C  | File header                                              |
-  | 0x001C - 0x05D8  | Metadata section (named key-value fields)                 |
-  | 0x05D8 - 0x0600  | HeaderDataEnd marker                                     |
-  | 0x0600 - 0x0628  | OverlapStart_0                                           |
-  | 0x0628 - 0x08DC  | LS_CvolIdOfElements (control volume IDs, I4 array)        |
-  | 0x08DC - 0x26B0  | LS_Links (element connectivity, I4 array)                 |
-  | 0x26B0 - 0x2C60  | LS_Nodes (vertex coordinates, R4[ n*3 ])                 |
-  | 0x2C60 - 0x42B0  | LS_SurfaceRegions                                        |
-  | 0x42B0 - 0x45A4  | Element_InformationFlag                                  |
-  | 0x45A4 - EOF     | OverlapEnd trailer                                       |
-  +------------------+----------------------------------------------------------+
+    file_header, metadata fields, HeaderDataEnd, OverlapStart_0,
+    LS_CvolIdOfElements, LS_Links, LS_Nodes,
+    LS_SurfaceRegions, LS_SolverUnusedRegions, LS_VolumeRegions,
+    LS_Parts, LS_Assemblies, Element_InformationFlag, OverlapEnd
 
-3. RECORD FORMAT
-----------------
+  Offsets differ per file (box.gph, box_ansa.gph, tr03.gph, laptop_*.gph).
 
-  Each named field follows:
+3. GENERIC DATA-BLOCK FORMAT
+----------------------------
+  Inside each named section, payloads use:
 
-    [length: I4] = 0x20 (32)
-    [name: C1[32]] = 32-byte ASCII name, space-padded
-    [length: I4] = 0x20 (32)  -- optional, section marker
-    [descriptor: variable]
-      - 0x0C 0x04 [dim0] [dim1]  : dimensions, data type 04 = I4
-      - 0x0C 0x08 [dim0] [dim1]  : data type 08 = R4 or I8
-    [value / array data]
+    [I4=12][I4=byte_count][payload][I4=byte_count]   (8-byte header + trailer)
 
-  Data type codes (inferred):
-    - 04 : I4 (32-bit signed integer)
-    - 08 : R4 (32-bit float) or I8 (64-bit int) depending on context
+  Interleaved 16-byte descriptors: [12, type_code, dim0, dim1]
+    type 4 = I4, type 8 = float64 (R8) in coordinate blocks.
 
-4. METADATA FIELDS (Header)
----------------------------
+4. LS_Nodes - vertex coordinates
+--------------------------------
+  Three equal-sized float64 axis blocks (X, Y, Z file order).
+  Dialect auto-detection: standard big-endian float64 vs word-reversed
+  (legacy); word-reversed files use X,Z,Y on disk -> permuted to X,Y,Z.
 
-  | Field               | Type      | Example / Notes                    |
-  |---------------------|-----------|-------------------------------------|
-  | FileRevision        | I4        | 2025                                |
-  | Application         | C1[8]     | "SCTpre"                            |
-  | ApplicationVersion  | I4        | 1                                   |
-  | ReleaseDate         | string    | date                                |
-  | GridType            | string    | grid type                           |
-  | Dimension           | I4        | spatial dimension (e.g. 3)          |
-  | Bias                | I4        |                                    |
-  | Date                | string    |                                    |
-  | Comments            | string    |                                    |
-  | Cycle               | I4        | simulation cycle                    |
-  | Encoding            | C1        | "UTF-8"                             |
+5. LS_Links - face / cell topology
+----------------------------------
+  At least three equal I4 blocks of length n_faces:
+    owner, neighbor (0xFFFFFFFF = boundary), npe (nodes per face).
+  Optional 4-byte face_type block (legacy SCTpre).
+  conn block: sum(npe) vertex indices, 0-based, CSR layout:
+    face i nodes = conn[face_offsets[i]:face_offsets[i+1]].
 
-5. DATA ARRAYS
---------------
+  Pure-triangle meshes: all npe=3.  Mixed/polyhedral (e.g. tr03.gph):
+  npe varies (3..11+).  conn may be row-major (ANSA) or column-major (legacy);
+  gph2cgns auto-detects via block sizes.
 
-  LS_CvolIdOfElements  : I4[n]    - control volume ID per element (n from descriptor)
-  LS_Links             : I4[]     - element connectivity (raw big-endian int32)
-  LS_Nodes             : R8[n,3]  - vertex XYZ as three word-reversed float64 blocks
-  LS_SurfaceRegions    : variable - surface boundary region definitions
-  Element_InformationFlag : flags per element
+6. LS_CvolIdOfElements - per-cell partition id
+----------------------------------------------
+  I4[n_cells]: each cell's cvol_id matches the opaque id stored in the
+  corresponding LS_Parts descriptor - NOT the 1-based index in LS_Parts.
+  Example: laptop_simplified_voxel_less.gph uses cvol_ids {1, 9, 11}.
 
-  LS_Nodes detail:
-    Each spatial axis is stored as one block.  All observed GPH files use a
-    single on-disk encoding:
-      [16B descriptor: I4=12 / I4=8 / I4=n_verts / I4=1]
-      [8B header:      I4=12 / I4=byte_count]
-      [n_verts × 8B]   standard big-endian IEEE-754 float64
-      [4B trailer:     I4=byte_count]
-    Axis order in the file: X, Y, Z.
+7. LS_Parts - part definitions
+------------------------------
+  Repeated records: 255-byte ASCII name block + trailing descriptors.
+  The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
+  before the next part's name block.
 
-    Examples:
-      Legacy box.gph     : 0.01 = 0x3F847AE147AE147B, stored as
-                           3F 84 7A E1 47 AE 14 7B (plain big-endian).
-      ANSA box_ansa.gph  : float32(0.01) widened to float64
-                           = 0x3F847AE140000000, stored as
-                           3F 84 7A E1 40 00 00 00.
+8. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
+-------------------------------------------------------
+  LS_VolumeRegions: ASCII names -> one CGNS Zone_t each (FluidRegion, etc.).
+  LS_Assemblies: XML tree; drives FPHPARTS.* / dotted zone names.
+  LS_SurfaceRegions: triplets (name, face_ids I4[], weights I4[]) -> ZoneBC
+  families (one BC_t per region; empty PointList when zone has no faces).
 
-    Historical note: the original parser skipped 12 bytes instead of 8 for
-    the data header and used a "word-reversed" reading.  For specific byte
-    patterns those two mistakes cancelled out on a handful of vertices,
-    which led to the misdiagnosis that the encoding was mid-endian.  Most
-    vertices, however, would have come out at ~1e37 magnitude — the
-    correct reading is straightforward big-endian float64 with an 8-byte
-    data header.  A word-reversed/12B-header fallback is still attempted
-    as defensive coverage for unknown variants.
-
-6. ALIGNMENT & PADDING
-----------------------
-  - Records appear 4-byte aligned.
-  - Names are fixed 32 bytes.
-  - Block markers use 0x20 (32) as length prefix.
-
-7. REFERENCES
--------------
-  - Similar to ADF (Advanced Data Format) used in CGNS.
-  - 32-char labels match ADF node label convention.
-  - CRDL-FLD may mean "Card/Record Field" or vendor-specific.
+9. CGNS export (gph2cgns.py)
+----------------------------
+  Writes FLDUTIL-compatible CGNS/HDF5: NGON_n faces, NFACE_n cells (signed
+  face ids), multi-zone layout from partition metadata, per-zone BC families.
+  HDF5 superblock v0 (libver earliest) for ANSA compatibility - see
+  GPH_FORMAT_SPEC.md section 9 and DEV_SUMMARY.md.
 
 ================================================================================
 """
@@ -397,8 +234,19 @@ def main():
     print()
     print("Sections:")
     for s in parsed["sections"]:
-        print(f"  {s['offset_hex']}-{s['end_hex']} ({s['size']:5} B) {s['name']}: {s['description']}")
+        desc = f": {s['description']}" if s["description"] else ""
+        print(f"  {s['offset_hex']}-{s['end_hex']} ({s['size']:5} B) {s['name']}{desc}")
     print()
+    if parsed.get("mesh_summary"):
+        print("Mesh topology:")
+        for k, v in parsed["mesh_summary"].items():
+            print(f"  {k}: {v}")
+        print()
+    if parsed.get("partition"):
+        print("Partition metadata:")
+        for k, v in parsed["partition"].items():
+            print(f"  {k}: {v}")
+        print()
     if parsed["data_arrays"]:
         print("Data samples:")
         for k, v in parsed["data_arrays"].items():
