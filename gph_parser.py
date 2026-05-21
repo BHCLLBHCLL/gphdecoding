@@ -11,6 +11,8 @@ from pathlib import Path
 
 from gph_model import (
     find_section,
+    iter_data_blocks,
+    open_gph_buffer,
     parse_ls_assemblies_summary,
     parse_ls_links_summary,
     parse_ls_nodes_vertices,
@@ -18,14 +20,17 @@ from gph_model import (
     parse_ls_string_list,
     parse_ls_surface_regions_summary,
     read_i32_be,
+    section_end,
 )
 
 
 def parse_gph(filepath: str) -> dict:
     """Parse GPH file and return structured description."""
-    with open(filepath, "rb") as f:
-        data = f.read()
+    with open_gph_buffer(filepath) as data:
+        return _parse_gph_buffer(data, filepath)
 
+
+def _parse_gph_buffer(data, filepath: str) -> dict:
     result = {
         "file_size": len(data),
         "byte_order": "big-endian",
@@ -77,11 +82,11 @@ def parse_gph(filepath: str) -> dict:
         })
 
     # --- Mesh / partition samples ---
-    verts, dialect, n_verts = parse_ls_nodes_vertices(data)
-    if verts:
+    sample, dialect, n_verts = parse_ls_nodes_vertices(data)
+    if n_verts:
         result["data_arrays"]["LS_Nodes_count"] = n_verts
         result["data_arrays"]["LS_Nodes_dialect"] = dialect
-        result["data_arrays"]["LS_Nodes_sample"] = verts[:3]
+        result["data_arrays"]["LS_Nodes_sample"] = sample
 
     links = parse_ls_links_summary(data)
     if links:
@@ -105,7 +110,6 @@ def parse_gph(filepath: str) -> dict:
 
     cv_sec = find_section(data, "LS_CvolIdOfElements")
     if cv_sec >= 0:
-        from gph_model import iter_data_blocks, section_end
         sec_end = section_end(data, cv_sec)
         for p, bc in iter_data_blocks(data, cv_sec, sec_end):
             if bc % 4 == 0 and bc >= 4:
@@ -113,8 +117,11 @@ def parse_gph(filepath: str) -> dict:
                 sample = [read_i32_be(data, p + i * 4) for i in range(min(10, n_cv))]
                 result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
                 result["data_arrays"]["LS_CvolIdOfElements_sample"] = sample
-                unique = sorted({read_i32_be(data, p + i * 4) for i in range(n_cv)})
-                result["data_arrays"]["LS_CvolIdOfElements_unique"] = unique[:20]
+                import numpy as np
+                cv_arr = np.frombuffer(data, dtype=">i4", count=n_cv, offset=p)
+                result["data_arrays"]["LS_CvolIdOfElements_unique"] = sorted(
+                    {int(x) for x in np.unique(cv_arr[:min(n_cv, 1_000_000)])}
+                )[:20]
                 break
 
     return result
@@ -123,7 +130,7 @@ def parse_gph(filepath: str) -> dict:
 def _section_blurb(name: str) -> str:
     blurbs = {
         "LS_CvolIdOfElements": "I4[n_cells] per-cell cvol_id (opaque Part id, not list index)",
-        "LS_Links": "face topology: owner, neighbor, npe, conn (polyhedral CSR)",
+        "LS_Links": "face topology: owner, neighbor, npe, conn (CSR; may split >1 GiB)",
         "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
         "LS_SurfaceRegions": "named BC regions -> global face id lists",
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
@@ -184,29 +191,38 @@ def format_description() -> str:
     face i nodes = conn[face_offsets[i]:face_offsets[i+1]].
 
   Pure-triangle meshes: all npe=3.  Mixed/polyhedral (e.g. tr03.gph):
-  npe varies (3..11+).  conn may be row-major (ANSA) or column-major (legacy);
-  gph2cgns auto-detects via block sizes.
+  npe varies (3..11+).  Voxel meshes (laptop_simplified_voxel_v4.gph) use
+  npe in {4,5,6,7} with ~10^7 faces and ~10^7 cells.
 
-6. LS_CvolIdOfElements - per-cell partition id
+  Large conn arrays (>~1 GiB): when sum(npe)*4 exceeds a single payload
+  limit (~1073741824 bytes), the conn data is split:
+    [12, bc1][conn part 1][bc1]  then  [I4=bc2][conn part 2 raw...]
+  The continuation uses a bare I4 byte_count (no [I4=12] header tag).
+  gph2cgns / gph_model concatenate both parts before CSR indexing.
+
+  Files >512 MiB: gph2cgns, gph_parser and gphviewer memory-map the file
+  instead of loading it entirely into RAM.
+
+9. LS_CvolIdOfElements - per-cell partition id
 ----------------------------------------------
   I4[n_cells]: each cell's cvol_id matches the opaque id stored in the
   corresponding LS_Parts descriptor - NOT the 1-based index in LS_Parts.
   Example: laptop_simplified_voxel_less.gph uses cvol_ids {1, 9, 11}.
 
-7. LS_Parts - part definitions
-------------------------------
+10. LS_Parts - part definitions
+-------------------------------
   Repeated records: 255-byte ASCII name block + trailing descriptors.
   The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
   before the next part's name block.
 
-8. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
--------------------------------------------------------
+11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
+--------------------------------------------------------
   LS_VolumeRegions: ASCII names -> one CGNS Zone_t each (FluidRegion, etc.).
   LS_Assemblies: XML tree; drives FPHPARTS.* / dotted zone names.
   LS_SurfaceRegions: triplets (name, face_ids I4[], weights I4[]) -> ZoneBC
   families (one BC_t per region; empty PointList when zone has no faces).
 
-9. CGNS export (gph2cgns.py)
+12. CGNS export (gph2cgns.py)
 ----------------------------
   Writes FLDUTIL-compatible CGNS/HDF5: NGON_n faces, NFACE_n cells (signed
   face ids), multi-zone layout from partition metadata, per-zone BC families.

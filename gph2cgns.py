@@ -148,6 +148,20 @@ def _iter_data_blocks(data: bytes, sec_start: int, sec_end: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _f64_be_array(buf, offset: int, count: int) -> np.ndarray:
+    """Read *count* big-endian float64 values from *buf* at *offset*."""
+    return np.frombuffer(buf, dtype=">f8", count=count, offset=offset).copy()
+
+
+def _f64_wr_array(buf, offset: int, count: int) -> np.ndarray:
+    """Read *count* word-reversed float64 values from *buf* at *offset*."""
+    raw = np.frombuffer(buf, dtype=">u4", count=count * 2, offset=offset)
+    lower = raw[0::2].astype(np.uint64)
+    upper = raw[1::2].astype(np.uint64)
+    bits = (upper << 32) | lower
+    return bits.view(">f8").astype(np.float64)
+
+
 def _parse_ls_nodes(data: bytes):
     """Parse the LS_Nodes section.
 
@@ -185,13 +199,9 @@ def _parse_ls_nodes(data: bytes):
     n_vertices = trio[0][1] // 8
 
     def _decode(reader):
-        axes = []
-        for payload_start, _ in trio:
-            vals = np.empty(n_vertices, dtype=np.float64)
-            for i in range(n_vertices):
-                vals[i] = reader(data, payload_start + i * 8)
-            axes.append(vals)
-        return axes
+        if reader is read_f64_be:
+            return [_f64_be_array(data, p, n_vertices) for p, _ in trio]
+        return [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
 
     axes_be = _decode(read_f64_be)
     axes_wr = _decode(read_f64_wr)
@@ -225,6 +235,29 @@ def _parse_ls_nodes(data: bytes):
 # ─────────────────────────────────────────────────────────────────────────────
 # LS_Links – face / cell connectivity
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _group_faces_by_cell_id(cell_ids: np.ndarray,
+                            face_indices: np.ndarray,
+                            n_cells: int) -> dict:
+    """Return ``{cell_id: [face_index, ...]}`` for parallel *cell_ids* / *face_indices*."""
+    out: dict = defaultdict(list)
+    if cell_ids.size == 0:
+        return out
+    order = np.argsort(cell_ids, kind="mergesort")
+    sorted_ids = cell_ids[order]
+    sorted_faces = face_indices[order]
+    boundaries = np.concatenate([
+        [0],
+        np.flatnonzero(sorted_ids[1:] != sorted_ids[:-1]) + 1,
+        [sorted_ids.size],
+    ])
+    for i in range(len(boundaries) - 1):
+        lo, hi = boundaries[i], boundaries[i + 1]
+        cid = int(sorted_ids[lo])
+        if 0 <= cid < n_cells:
+            out[cid] = sorted_faces[lo:hi].tolist()
+    return out
 
 
 def _parse_ls_links(data: bytes):
@@ -316,12 +349,54 @@ def _parse_ls_links(data: bytes):
     if conn_block is None:
         return None
     conn_p, conn_bc = conn_block
-    conn_total = conn_bc // 4
-    if conn_total < conn_total_expected:
-        return None
+    conn_parts = [
+        np.frombuffer(data, dtype=">u4", count=conn_bc // 4, offset=conn_p)
+        .astype(np.int64)
+        .copy()
+    ]
+    got = int(conn_parts[0].size)
 
-    conn = np.frombuffer(data[conn_p : conn_p + conn_total_expected * 4],
-                         dtype=">u4").astype(np.int64).copy()
+    if got < conn_total_expected:
+        # Very large meshes (e.g. laptop_simplified_voxel_v4.gph) split the
+        # conn array when a single payload would exceed ~1 GiB.  The primary
+        # block is followed by a bare I4 byte_count and a raw continuation
+        # payload (no [I4=12] header tag).
+        pos = conn_p + conn_bc + 4
+        while got < conn_total_expected and pos + 4 <= sec_end:
+            need_bytes = (conn_total_expected - got) * 4
+
+            bare_bc = read_i32_be(data, pos)
+            if (bare_bc >= need_bytes
+                    and bare_bc % 4 == 0
+                    and pos + 4 + bare_bc <= sec_end):
+                chunk = np.frombuffer(
+                    data, dtype=">u4", count=bare_bc // 4, offset=pos + 4
+                ).astype(np.int64).copy()
+                conn_parts.append(chunk)
+                got += int(chunk.size)
+                pos += 4 + bare_bc
+                continue
+
+            if (read_i32_be(data, pos) == 12
+                    and pos + 8 <= sec_end):
+                bc2 = read_i32_be(data, pos + 4)
+                if (bc2 > 0 and bc2 % 4 == 0
+                        and pos + 8 + bc2 + 4 <= sec_end
+                        and read_i32_be(data, pos + 8 + bc2) == bc2):
+                    chunk = np.frombuffer(
+                        data, dtype=">u4", count=bc2 // 4, offset=pos + 8
+                    ).astype(np.int64).copy()
+                    conn_parts.append(chunk)
+                    got += int(chunk.size)
+                    pos += 8 + bc2 + 4
+                    continue
+            break
+
+        if got < conn_total_expected:
+            return None
+        conn = np.concatenate(conn_parts)[:conn_total_expected]
+    else:
+        conn = conn_parts[0][:conn_total_expected]
 
     # ``face_nodes`` is now stored in *CSR-style* form: a flat 1-D array of
     # 0-based vertex indices plus a length-``n_faces+1`` offset array.  Face
@@ -336,17 +411,14 @@ def _parse_ls_links(data: bytes):
     # carry a positive index while faces for which the cell is the neighbour
     # are stored as a negative (reverse-oriented) index. ─────────────────────
     n_cells = int(max(owner.max() + 1, (neigh.max() + 1) if (neigh >= 0).any() else 0))
-    cell_owner_faces: dict = defaultdict(list)
-    cell_neighbor_faces: dict = defaultdict(list)
-    for fi in range(n_faces):
-        ow = int(owner[fi])
-        if 0 <= ow < n_cells:
-            cell_owner_faces[ow].append(fi)
-        nb = int(neigh[fi])
-        if nb != -1 and 0 <= nb < n_cells:
-            cell_neighbor_faces[nb].append(fi)
+    all_faces = np.arange(n_faces, dtype=np.int64)
+    cell_owner_faces = _group_faces_by_cell_id(owner, all_faces, n_cells)
+    neigh_valid = neigh >= 0
+    cell_neighbor_faces = _group_faces_by_cell_id(
+        neigh[neigh_valid], all_faces[neigh_valid], n_cells,
+    )
 
-    boundary_faces = [fi for fi in range(n_faces) if neigh[fi] == -1]
+    boundary_faces = np.flatnonzero(neigh == -1).tolist()
 
     return {
         "n_faces": n_faces,
@@ -738,69 +810,84 @@ def parse_gph_mesh(filepath: str) -> dict:
     (``LS_CvolIdOfElements``, ``LS_VolumeRegions``, ``LS_Parts``,
     ``LS_Assemblies`` XML).
     """
-    with open(filepath, "rb") as f:
-        data = f.read()
+    gph_path = Path(filepath)
+    file_size = gph_path.stat().st_size
+    # Memory-map multi-hundred-MiB / GiB files instead of loading them fully
+    # into RAM (laptop_simplified_voxel_v4.gph is ~3.7 GiB on disk).
+    if file_size > 512 * 1024 * 1024:
+        import mmap
+        f = open(filepath, "rb")
+        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    else:
+        f = None
+        with open(filepath, "rb") as fh:
+            data = fh.read()
 
-    result: dict = {
-        "vertices": None,
-        "n_vertices": 0,
-        "link_data": None,
-        "n_elements": 0,
-        "cvol_id": None,
-        "volume_regions": [],
-        "parts": [],
-        "part_assembly": {},
-        "surface_regions": [],
-    }
+    try:
+        result: dict = {
+            "vertices": None,
+            "n_vertices": 0,
+            "link_data": None,
+            "n_elements": 0,
+            "cvol_id": None,
+            "volume_regions": [],
+            "parts": [],
+            "part_assembly": {},
+            "surface_regions": [],
+        }
 
-    xyz, n_vertices = _parse_ls_nodes(data)
-    link_data = _parse_ls_links(data)
+        xyz, n_vertices = _parse_ls_nodes(data)
+        link_data = _parse_ls_links(data)
 
-    # Partition metadata is always parsed if present, even if mesh is broken.
-    result["cvol_id"] = _parse_ls_cvol_ids(data)
-    result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
-    result["parts_with_cvol"] = _parse_ls_parts_with_cvol_ids(data)
-    # Backward-compat: legacy ``parts`` list of just the part names.
-    result["parts"] = [name for name, _ in result["parts_with_cvol"]]
-    result["assembly_info"] = _parse_ls_assemblies(data)
-    # Backward-compat: legacy ``part_assembly`` (part_name → immediate parent
-    # assembly name).  Re-derived from the full path.
-    legacy_part_asm: dict[str, Optional[str]] = {}
-    for pname, path in result["assembly_info"]["part_paths"].items():
-        if path is None:
-            legacy_part_asm[pname] = None
-        else:
-            parts_of_path = path.split(".")
-            legacy_part_asm[pname] = parts_of_path[-2] if len(parts_of_path) >= 2 else None
-    result["part_assembly"] = legacy_part_asm
-    result["surface_regions"] = _parse_ls_surface_regions(data)
+        # Partition metadata is always parsed if present, even if mesh is broken.
+        result["cvol_id"] = _parse_ls_cvol_ids(data)
+        result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
+        result["parts_with_cvol"] = _parse_ls_parts_with_cvol_ids(data)
+        # Backward-compat: legacy ``parts`` list of just the part names.
+        result["parts"] = [name for name, _ in result["parts_with_cvol"]]
+        result["assembly_info"] = _parse_ls_assemblies(data)
+        # Backward-compat: legacy ``part_assembly`` (part_name → immediate parent
+        # assembly name).  Re-derived from the full path.
+        legacy_part_asm: dict[str, Optional[str]] = {}
+        for pname, path in result["assembly_info"]["part_paths"].items():
+            if path is None:
+                legacy_part_asm[pname] = None
+            else:
+                parts_of_path = path.split(".")
+                legacy_part_asm[pname] = parts_of_path[-2] if len(parts_of_path) >= 2 else None
+        result["part_assembly"] = legacy_part_asm
+        result["surface_regions"] = _parse_ls_surface_regions(data)
 
-    if xyz is None or n_vertices == 0 or link_data is None:
+        if xyz is None or n_vertices == 0 or link_data is None:
+            return result
+
+        # Clamp any garbage node indices that exceed the known vertex count
+        # (occasional byte-count sentinel leakage seen on legacy files).  The
+        # face-node array is now stored as a flat 1-D vector (CSR-style); index
+        # bound-checking is applied directly to it.
+        fn = link_data["face_nodes"]
+        bad = fn >= n_vertices
+        if bad.any():
+            fn = fn.copy()
+            fn[bad] = n_vertices - 1
+            link_data["face_nodes"] = fn
+
+        # Renumber vertices according to first-use order — matches FLDUTIL.
+        perm = _renumber_by_first_use(link_data["face_nodes"], n_vertices)
+        inv_perm = np.argsort(perm)
+        xyz_renum = xyz[inv_perm]
+        link_data["face_nodes"] = perm[link_data["face_nodes"]]
+
+        result["vertices"] = xyz_renum
+        result["n_vertices"] = n_vertices
+        result["link_data"] = link_data
+        result["n_elements"] = link_data["n_cells"]
+
         return result
-
-    # Clamp any garbage node indices that exceed the known vertex count
-    # (occasional byte-count sentinel leakage seen on legacy files).  The
-    # face-node array is now stored as a flat 1-D vector (CSR-style); index
-    # bound-checking is applied directly to it.
-    fn = link_data["face_nodes"]
-    bad = fn >= n_vertices
-    if bad.any():
-        fn = fn.copy()
-        fn[bad] = n_vertices - 1
-        link_data["face_nodes"] = fn
-
-    # Renumber vertices according to first-use order — matches FLDUTIL.
-    perm = _renumber_by_first_use(link_data["face_nodes"], n_vertices)
-    inv_perm = np.argsort(perm)
-    xyz_renum = xyz[inv_perm]
-    link_data["face_nodes"] = perm[link_data["face_nodes"]]
-
-    result["vertices"] = xyz_renum
-    result["n_vertices"] = n_vertices
-    result["link_data"] = link_data
-    result["n_elements"] = link_data["n_cells"]
-
-    return result
+    finally:
+        if f is not None:
+            data.close()
+            f.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

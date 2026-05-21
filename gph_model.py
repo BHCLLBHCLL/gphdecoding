@@ -4,8 +4,14 @@ GPH data model - parse binary to editable tree, support partial save.
 """
 
 import struct
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+import numpy as np
+
+_LARGE_GPH_BYTES = 512 * 1024 * 1024  # mmap threshold (see gph2cgns.parse_gph_mesh)
 
 
 def read_i32_be(data: bytes, pos: int) -> int:
@@ -45,6 +51,85 @@ def _looks_like_coords(values: list) -> bool:
         if a != 0.0 and (a > 1e6 or a < 1e-30):
             return False
     return True
+
+
+@contextmanager
+def open_gph_buffer(filepath: str):
+    """Yield a bytes-like buffer for a GPH file.
+
+    Files larger than 512 MiB are memory-mapped (as in ``gph2cgns.py``) so
+    multi-gigabyte meshes such as ``laptop_simplified_voxel_v4.gph`` can be
+    inspected without a full-RAM copy.
+    """
+    size = Path(filepath).stat().st_size
+    if size <= _LARGE_GPH_BYTES:
+        with open(filepath, "rb") as f:
+            yield f.read()
+        return
+    import mmap
+    f = open(filepath, "rb")
+    try:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            yield mm
+        finally:
+            mm.close()
+    finally:
+        f.close()
+
+
+def _f64_be_array(buf, offset: int, count: int) -> np.ndarray:
+    return np.frombuffer(buf, dtype=">f8", count=count, offset=offset).copy()
+
+
+def _f64_wr_array(buf, offset: int, count: int) -> np.ndarray:
+    raw = np.frombuffer(buf, dtype=">u4", count=count * 2, offset=offset)
+    lower = raw[0::2].astype(np.uint64)
+    upper = raw[1::2].astype(np.uint64)
+    bits = (upper << 32) | lower
+    return bits.view(">f8").astype(np.float64)
+
+
+def _conn_payload_size(data, blocks, triples, conn_total_expected: int,
+                       sec_end: int) -> tuple[int, bool]:
+    """Return (conn_entry_count, split) for the LS_Links conn array."""
+    conn_block = None
+    for p, bc in blocks:
+        if (p, bc) in triples:
+            continue
+        if bc % 4 != 0:
+            continue
+        if bc // 4 == conn_total_expected:
+            return conn_total_expected, False
+        if bc < 12:
+            continue
+        if conn_block is None or bc > conn_block[1]:
+            conn_block = (p, bc)
+    if conn_block is None:
+        return 0, False
+    conn_p, conn_bc = conn_block
+    got = conn_bc // 4
+    if got >= conn_total_expected:
+        return conn_total_expected, False
+    pos = conn_p + conn_bc + 4
+    while got < conn_total_expected and pos + 4 <= sec_end:
+        need_bytes = (conn_total_expected - got) * 4
+        bare_bc = read_i32_be(data, pos)
+        if (bare_bc >= need_bytes and bare_bc % 4 == 0
+                and pos + 4 + bare_bc <= sec_end):
+            got += bare_bc // 4
+            pos += 4 + bare_bc
+            continue
+        if read_i32_be(data, pos) == 12:
+            bc2 = read_i32_be(data, pos + 4)
+            if (bc2 > 0 and bc2 % 4 == 0
+                    and pos + 8 + bc2 + 4 <= sec_end
+                    and read_i32_be(data, pos + 8 + bc2) == bc2):
+                got += bc2 // 4
+                pos += 8 + bc2 + 4
+                continue
+        break
+    return got, got >= conn_total_expected and got > conn_bc // 4
 
 
 # ── Shared section scanners (aligned with gph2cgns.py) ───────────────────────
@@ -106,8 +191,15 @@ def iter_data_blocks(data: bytes, sec_start: int, sec_end: int):
         pos = payload_end + 4
 
 
-def parse_ls_nodes_vertices(data: bytes) -> tuple[Optional[list[tuple[float, float, float]]], str, int]:
-    """Parse LS_Nodes → (vertices, dialect_label, n_vertices)."""
+def parse_ls_nodes_vertices(
+    data: bytes,
+    max_preview: int = 3,
+) -> tuple[Optional[list[tuple[float, float, float]]], str, int]:
+    """Parse LS_Nodes -> (coord_sample, dialect_label, n_vertices).
+
+    For large meshes only *max_preview* coordinates are materialised (for
+    display); the full vertex count is always returned.
+    """
     sec_start = find_section(data, "LS_Nodes")
     if sec_start < 0:
         return None, "", 0
@@ -123,40 +215,41 @@ def parse_ls_nodes_vertices(data: bytes) -> tuple[Optional[list[tuple[float, flo
         return None, "", 0
     n_vertices = trio[0][1] // 8
 
-    def _decode(reader):
-        axes: list[list[float]] = []
-        for payload_start, _ in trio:
-            vals = [reader(data, payload_start + i * 8) for i in range(n_vertices)]
-            axes.append(vals)
-        return axes
+    def _decode_be():
+        return [_f64_be_array(data, p, n_vertices) for p, _ in trio]
+
+    def _decode_wr():
+        return [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
 
     def _score(axes):
         score = 0.0
         for ax in axes:
-            for v in ax:
-                if not (v == v):  # NaN
-                    score += 1e30
-                    continue
-                a = abs(v)
-                if a != 0.0 and (a > 1e6 or a < 1e-30):
-                    score += a + (1.0 / max(a, 1e-300))
-                else:
-                    score += a
+            finite = np.isfinite(ax)
+            if not finite.all():
+                score += 1e30
+                continue
+            absmax = float(np.max(np.abs(ax))) if ax.size else 0.0
+            if absmax > 1e6 or absmax < 1e-30 and absmax != 0.0:
+                score += absmax + (1.0 / max(absmax, 1e-300))
+            else:
+                score += absmax
         return score
 
-    axes_be = _decode(read_f64_be)
-    axes_wr = _decode(read_f64_wr)
+    axes_be = _decode_be()
+    axes_wr = _decode_wr()
     if _score(axes_be) <= _score(axes_wr):
         axes, dialect = axes_be, "standard BE float64"
         col_perm = (0, 1, 2)
     else:
         axes, dialect = axes_wr, "word-reversed float64"
         col_perm = (0, 2, 1)
-    verts = [
-        (axes[col_perm[0]][i], axes[col_perm[1]][i], axes[col_perm[2]][i])
-        for i in range(n_vertices)
+    n_show = min(n_vertices, max_preview)
+    sample = [
+        (float(axes[col_perm[0]][i]), float(axes[col_perm[1]][i]),
+         float(axes[col_perm[2]][i]))
+        for i in range(n_show)
     ]
-    return verts, dialect, n_vertices
+    return sample, dialect, n_vertices
 
 
 def parse_ls_links_summary(data: bytes) -> Optional[dict]:
@@ -181,27 +274,28 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
     triples = [b for b in blocks if b[1] == n_faces_block_size][:3]
     if len(triples) < 3:
         return None
-    npe_p, _ = triples[2]
-    npe = [read_i32_be(data, npe_p + i * 4) for i in range(n_faces)]
-    conn_total = sum(npe)
-    boundary = 0
-    BNDRY = 0xFFFFFFFF
-    neigh_p, _ = triples[1]
-    for i in range(n_faces):
-        raw = data[neigh_p + i * 4 : neigh_p + i * 4 + 4]
-        if int.from_bytes(raw, "big") == BNDRY:
-            boundary += 1
     owner_p, _ = triples[0]
-    max_own = max(read_i32_be(data, owner_p + i * 4) for i in range(n_faces))
-    n_cells = max_own + 1
+    neigh_p, _ = triples[1]
+    npe_p, _ = triples[2]
+    npe = np.frombuffer(data, dtype=">u4", count=n_faces, offset=npe_p).astype(np.int64)
+    conn_total = int(npe.sum())
+    neigh_raw = np.frombuffer(data, dtype=">u4", count=n_faces, offset=neigh_p)
+    boundary = int((neigh_raw == 0xFFFFFFFF).sum())
+    owner = np.frombuffer(data, dtype=">u4", count=n_faces, offset=owner_p)
+    n_cells = int(owner.max()) + 1
+    conn_got, conn_split = _conn_payload_size(
+        data, blocks, triples, conn_total, sec_end,
+    )
     return {
         "n_faces": n_faces,
         "n_cells": n_cells,
         "boundary_faces": boundary,
-        "npe_min": min(npe),
-        "npe_max": max(npe),
+        "npe_min": int(npe.min()),
+        "npe_max": int(npe.max()),
         "conn_entries": conn_total,
-        "polyhedral": max(npe) > 3 if npe else False,
+        "conn_got": conn_got,
+        "conn_split": conn_split,
+        "polyhedral": int(npe.max()) > 3,
     }
 
 
@@ -366,23 +460,45 @@ class GphDocument:
 
     def __init__(self):
         self.filepath: Optional[str] = None
-        self._raw_data: bytearray = bytearray()
+        self._raw_data: Any = bytearray()
+        self._file_handle: Any = None
+        self._mmap_mode: bool = False
         self.root: Optional[GphNode] = None
         self._patches: list[tuple[int, bytes]] = []  # (offset, new_bytes)
 
+    def close(self) -> None:
+        if self._mmap_mode and self._raw_data is not None:
+            self._raw_data.close()
+        if self._file_handle is not None:
+            self._file_handle.close()
+        self._raw_data = bytearray()
+        self._file_handle = None
+        self._mmap_mode = False
+
     def load(self, filepath: str) -> bool:
         try:
-            with open(filepath, "rb") as f:
-                self._raw_data = bytearray(f.read())
+            self.close()
+            size = Path(filepath).stat().st_size
+            if size > _LARGE_GPH_BYTES:
+                import mmap
+                self._file_handle = open(filepath, "rb")
+                self._raw_data = mmap.mmap(
+                    self._file_handle.fileno(), 0, access=mmap.ACCESS_READ,
+                )
+                self._mmap_mode = True
+            else:
+                with open(filepath, "rb") as f:
+                    self._raw_data = bytearray(f.read())
             self.filepath = filepath
             self._patches = []
             self.root = self._parse()
             return True
         except Exception:
+            self.close()
             return False
 
     def _parse(self) -> GphNode:
-        data = bytes(self._raw_data)
+        data = self._raw_data
         root = GphNode("GPH File", 0, len(data), "raw", children=[])
 
         # ── Dynamically locate every known named section ────────────────────
@@ -434,25 +550,28 @@ class GphDocument:
             v = read_i32_be(raw, 64) if len(raw) > 64 else 0
             return GphNode(name, offset, len(raw), "I4", value=v, raw=raw, children=[])
 
-        file_data = bytes(self._raw_data)
+        file_data = self._raw_data
 
         if name == "LS_CvolIdOfElements":
             arr = self._read_i4_array_after_label(raw)
-            unique_cv = sorted(set(arr)) if arr else []
+            if arr is None:
+                return GphNode(name, offset, len(raw), "I4[]",
+                               value=None, raw=raw, children=[])
+            unique_cv = sorted(set(arr))
             summary = (
                 f"I4[{len(arr)}] cvol_ids={unique_cv[:12]}"
                 f"{'...' if len(unique_cv) > 12 else ''}"
-                if arr is not None else "I4[]"
             )
+            preview = arr[:1000] if len(arr) > 1000 else arr
             return GphNode(name, offset, len(raw), summary,
-                           value=arr, raw=raw, children=[])
+                           value=preview, raw=raw, children=[])
 
         if name == "LS_Nodes":
-            verts, dialect, n_vertices = parse_ls_nodes_vertices(file_data)
-            if verts and n_vertices:
+            sample, dialect, n_vertices = parse_ls_nodes_vertices(file_data)
+            if n_vertices:
                 dtype = f"R8[{n_vertices},3] ({dialect})"
                 return GphNode(name, offset, len(raw), dtype,
-                               value=verts, raw=raw, children=[])
+                               value=sample, raw=raw, children=[])
             return GphNode(name, offset, len(raw), "R8[]", value=None, raw=raw, children=[])
 
         if name == "LS_Links":
@@ -463,6 +582,7 @@ class GphDocument:
                     f"BC={summary['boundary_faces']} "
                     f"npe=[{summary['npe_min']}..{summary['npe_max']}]"
                     + (" polyhedral" if summary["polyhedral"] else "")
+                    + (" conn_split" if summary.get("conn_split") else "")
                 )
                 return GphNode(name, offset, len(raw), "topology", value=val,
                                raw=raw, children=[])
@@ -575,6 +695,8 @@ class GphDocument:
 
     def apply_patch(self, offset: int, new_bytes: bytes) -> None:
         """Record a modification for save."""
+        if self._mmap_mode:
+            raise RuntimeError("Cannot edit memory-mapped GPH files in place")
         self._patches.append((offset, new_bytes))
         if offset + len(new_bytes) <= len(self._raw_data):
             self._raw_data[offset : offset + len(new_bytes)] = new_bytes

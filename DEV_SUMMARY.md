@@ -12,6 +12,7 @@
 8. [第三阶段：ANSA 方言适配 + FLDUTIL 输出对齐](#8-第三阶段ansa-方言适配--fldutil-输出对齐)
 9. [第四阶段：HDF5 superblock 版本与 ANSA 兼容性](#9-第四阶段hdf5-superblock-版本与-ansa-兼容性)
 10. [第五阶段：多 Zone 分区、多面体网格与命名 BC](#10-第五阶段多-zone-分区多面体网格与命名-bc)
+11. [第六阶段：超大 GPH（conn 分块 + mmap）](#11-第六阶段超大-gphconn-分块--mmap)
 
 ---
 
@@ -655,7 +656,7 @@ face i 的节点 = conn[face_offsets[i] : face_offsets[i+1]]
 | `gph_parser.py` | 动态节布局；mesh/partition 摘要输出；更新 `format_description()` |
 | `gphviewer.py` | 树中显示新节；状态栏 mesh 摘要；分区/拓扑只读 |
 | `GPH_FORMAT_SPEC.md` | §5.1–5.7 分区节；§6 多 Zone CGNS；§9 HDF5 约束 |
-| `DEV_SUMMARY.md` | 本节 |
+| `DEV_SUMMARY.md` | 本节；超大文件见 §11 |
 
 **相关提交**（main 分支近期）：
 
@@ -664,3 +665,54 @@ f93f997  fix(gph2cgns): correct cvol_id ↔ part mapping (#13)
 e56e6d7  feat(gph2cgns): multi-zone partitioning + polyhedral mesh (#11)
 dcc8bce  feat(gph2cgns): per-zone named BC families from LS_SurfaceRegions (#12)
 ```
+
+---
+
+## 11. 第六阶段：超大 GPH（conn 分块 + mmap）
+
+### 11.1 问题现象
+
+`laptop_simplified_voxel_v4.gph`（磁盘 **~3.7 GiB**）转换时报：
+
+```
+Vertices : 0
+Cells    : 0  (LS_Links parse failed)
+Error: could not extract mesh data from GPH.
+```
+
+### 11.2 根因
+
+1. **conn 超 1 GiB 被拆分**：88M 面、`sum(npe)=360,934,738` 的 conn 需 ~1.44 GiB。文件里第一段 conn 块为 **1073741824 B**（268,435,456 个 I4），trailer 后紧跟 **`[I4=byte_count][raw 续接 payload]`**（无 `[I4=12]` 头），第二段 ~370 MiB。
+2. **旧逻辑直接失败**：`_parse_ls_links` 在 `conn_block_entries < sum(npe)` 时 `return None`。
+3. **性能/内存**：3370 万顶点用 Python 循环读 float64 极慢；整文件 `read()` 占满 3.7 GB RAM。
+
+### 11.3 修复
+
+| 改动 | 说明 |
+|------|------|
+| conn 续接 | 主块不足时读取裸 `byte_count` + raw 续块（亦支持标准 `[12,bc]` 块） |
+| 坐标读取 | `np.frombuffer` 批量读三轴 float64 |
+| 大文件 I/O | `>512 MiB` 使用 **mmap**（`parse_gph_mesh` / `open_gph_buffer` / `GphDocument.load`） |
+| 面→单元映射 | 88M 面 `argsort` 分组，替代 Python 循环 |
+
+### 11.4 验证（v4）
+
+```
+Vertices : 33723176
+Faces    : 88833031  (polyhedral, 4..7 nodes per face)
+Cells    : 27553410
+Zones    : 4  (FluidRegion + out_air + rotation1 + rotation2)
+```
+
+解析 ~5 min，完整 CGNS ~16 min（输出 ~14 GiB）。
+
+### 11.5 配套同步
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph2cgns.py` | conn 续接、mmap、frombuffer、向量化 cell-face 映射 |
+| `gph_model.py` | `open_gph_buffer`、conn 分块检测、`parse_ls_links_summary` / `parse_ls_nodes_vertices` 对齐 |
+| `gph_parser.py` | mmap 解析、format 文本补充 conn 分块 |
+| `gphviewer.py` | 大文件 mmap 打开、只读提示、状态栏 mesh 摘要 |
+| `GPH_FORMAT_SPEC.md` | §5.2 conn 分块、§6.1 超大文件 |
+| `DEV_SUMMARY.md` | 本节 |

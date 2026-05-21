@@ -70,6 +70,7 @@ except ImportError:
 from gph_model import (
     GphDocument,
     GphNode,
+    open_gph_buffer,
     parse_ls_links_summary,
     parse_ls_nodes_vertices,
     parse_ls_parts,
@@ -193,16 +194,20 @@ class GphViewerMain(QMainWindow):
         self._build_tree()
         self.setWindowTitle(f"GPH Viewer - {Path(path).name}")
         summary = self._file_summary(path)
+        size_mb = len(self.doc._raw_data) / (1024 * 1024)
+        mmap_note = " (mmap, read-only)" if getattr(self.doc, "_mmap_mode", False) else ""
         self.statusBar().showMessage(
-            f"Opened: {path} ({len(self.doc._raw_data)} bytes) — {summary}"
+            f"Opened: {path} ({size_mb:.1f} MiB{mmap_note}) — {summary}"
         )
 
     def _file_summary(self, path: str) -> str:
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            with open_gph_buffer(path) as data:
+                return self._summarize_buffer(data)
         except OSError:
             return ""
+
+    def _summarize_buffer(self, data) -> str:
         parts = []
         _, _, nv = parse_ls_nodes_vertices(data)
         if nv:
@@ -213,6 +218,8 @@ class GphViewerMain(QMainWindow):
             parts.append(f"{links['n_cells']} cells")
             if links.get("polyhedral"):
                 parts.append("polyhedral")
+            if links.get("conn_split"):
+                parts.append("conn_split")
         pmeta = parse_ls_parts(data)
         if pmeta:
             parts.append(f"{len(pmeta)} parts")
@@ -409,6 +416,13 @@ class GphViewerMain(QMainWindow):
         self.statusBar().showMessage(f"Modified {node.name} (unsaved)")
 
     def on_save(self):
+        if getattr(self.doc, "_mmap_mode", False):
+            QMessageBox.warning(
+                self, "Read-only",
+                "This file was opened via memory-map (large GPH). "
+                "Saving in place is not supported.",
+            )
+            return
         if not self.doc.filepath:
             self.on_save_as()
             return
