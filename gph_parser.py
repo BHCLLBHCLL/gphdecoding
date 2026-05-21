@@ -9,18 +9,19 @@ Byte order: Big-Endian for all multi-byte integers and metadata.
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from gph_model import (
     find_section,
-    iter_data_blocks,
     open_gph_buffer,
     parse_ls_assemblies_summary,
+    parse_ls_cvol_ids,
     parse_ls_links_summary,
     parse_ls_nodes_vertices,
     parse_ls_parts,
     parse_ls_string_list,
     parse_ls_surface_regions_summary,
     read_i32_be,
-    section_end,
 )
 
 
@@ -108,21 +109,14 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
     if asm.get("part_paths") or asm.get("root_empty_prefix"):
         result["partition"]["LS_Assemblies"] = asm
 
-    cv_sec = find_section(data, "LS_CvolIdOfElements")
-    if cv_sec >= 0:
-        sec_end = section_end(data, cv_sec)
-        for p, bc in iter_data_blocks(data, cv_sec, sec_end):
-            if bc % 4 == 0 and bc >= 4:
-                n_cv = bc // 4
-                sample = [read_i32_be(data, p + i * 4) for i in range(min(10, n_cv))]
-                result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
-                result["data_arrays"]["LS_CvolIdOfElements_sample"] = sample
-                import numpy as np
-                cv_arr = np.frombuffer(data, dtype=">i4", count=n_cv, offset=p)
-                result["data_arrays"]["LS_CvolIdOfElements_unique"] = sorted(
-                    {int(x) for x in np.unique(cv_arr[:min(n_cv, 1_000_000)])}
-                )[:20]
-                break
+    cvol = parse_ls_cvol_ids(data)
+    if cvol is not None:
+        n_cv = len(cvol)
+        sample = cvol[:10].tolist()
+        result["data_arrays"]["LS_CvolIdOfElements_count"] = n_cv
+        result["data_arrays"]["LS_CvolIdOfElements_sample"] = sample
+        unique = sorted({int(x) for x in np.unique(cvol[:min(n_cv, 1_000_000)])})
+        result["data_arrays"]["LS_CvolIdOfElements_unique"] = unique[:20]
 
     return result
 

@@ -448,18 +448,25 @@ def _parse_ls_links(data: bytes):
 def _parse_ls_cvol_ids(data: bytes) -> Optional[np.ndarray]:
     """Parse ``LS_CvolIdOfElements`` → 1-D int64 array, one entry per cell.
 
-    Each entry holds the 1-based **Part index** of the cell.  For instance in
-    ``tr03.gph`` this array has 63 882 entries with values 1 (Case part) or
-    2 (Rotate part).  Returns ``None`` if the section is missing or malformed.
+    Each entry holds the opaque **cvol_id** of the cell's Part (see
+    ``LS_Parts``).  Large files such as ``laptop_simplified_voxel_v4.gph``
+    may prefix the array with a small 4-byte metadata block (holding the
+    cell count); the actual ``I4[n_cells]`` payload is the **largest**
+    qualifying data block in the section.
     """
     sec_start = _find_section(data, "LS_CvolIdOfElements")
     if sec_start < 0:
         return None
     sec_end = _section_end(data, sec_start)
+    best: Optional[tuple[int, int]] = None
     for p, bc in _iter_data_blocks(data, sec_start, sec_end):
         if bc % 4 == 0 and bc >= 4:
-            return np.frombuffer(data[p : p + bc], dtype=">i4").astype(np.int64).copy()
-    return None
+            if best is None or bc > best[1]:
+                best = (p, bc)
+    if best is None:
+        return None
+    p, bc = best
+    return np.frombuffer(data, dtype=">i4", count=bc // 4, offset=p).astype(np.int64).copy()
 
 
 def _parse_ls_string_section(data: bytes, section_name: str) -> list[str]:

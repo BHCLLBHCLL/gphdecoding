@@ -716,3 +716,20 @@ Zones    : 4  (FluidRegion + out_air + rotation1 + rotation2)
 | `gphviewer.py` | 大文件 mmap 打开、只读提示、状态栏 mesh 摘要 |
 | `GPH_FORMAT_SPEC.md` | §5.2 conn 分块、§6.1 超大文件 |
 | `DEV_SUMMARY.md` | 本节 |
+
+### 11.6 cvol_id 数组误读（v4 分区/ZoneBC 连带 Bug）
+
+**现象**：v4 转换后 4 个 Zone 均显示 27 553 410 cells；`out_air` Zone 的 `impeller1_s` / `impeller2_s` PointList 非空（参考 `laptop_simplified_voxel_v4_orig.cgns` 应为空）。
+
+**根因**：`LS_CvolIdOfElements` 节含两个数据块——先是一个 **4 B** 的 metadata（值 = cell 总数），再是 **110 MB** 的 `I4[n_cells]` 真数组。旧代码取**第一个**块，得到长度 1 的数组 `[27553410]`，导致 `len(cvol_id) != n_cells`，所有 Part Zone 的 cell 掩码回退为全网格。
+
+**修复**：取节内 byte_count **最大**的 I4 块。修复后分区与参考一致：
+
+| Zone | cells |
+|------|------:|
+| FluidRegion | 27 553 410 |
+| laptop_3d_geom.____.out_air | 14 159 314 |
+| fan2.fan1.rotation1 | 6 697 048 |
+| fan2.fan1.rotation2 | 6 697 048 |
+
+ZoneBC 中 `out_air` 的 `impeller1_s` / `impeller2_s` PointList 恢复为空。

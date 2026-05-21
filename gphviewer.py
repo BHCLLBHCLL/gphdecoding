@@ -70,10 +70,11 @@ except ImportError:
 from gph_model import (
     GphDocument,
     GphNode,
-    open_gph_buffer,
+    parse_ls_cvol_ids,
     parse_ls_links_summary,
     parse_ls_nodes_vertices,
     parse_ls_parts,
+    parse_ls_string_list,
 )
 
 
@@ -119,6 +120,8 @@ class GphViewerMain(QMainWindow):
         exit_act.setShortcut("Ctrl+Q")
         exit_act.triggered.connect(self.close)
         file_menu.addAction(exit_act)
+
+        self._mmap_readonly = False
 
         # Central widget
         central = QWidget()
@@ -191,21 +194,19 @@ class GphViewerMain(QMainWindow):
         if not self.doc.load(path):
             QMessageBox.critical(self, "Error", f"Failed to load: {path}")
             return
+        self._mmap_readonly = getattr(self.doc, "_mmap_mode", False)
         self._build_tree()
         self.setWindowTitle(f"GPH Viewer - {Path(path).name}")
-        summary = self._file_summary(path)
+        summary = self._summarize_buffer(self.doc._raw_data)
         size_mb = len(self.doc._raw_data) / (1024 * 1024)
-        mmap_note = " (mmap, read-only)" if getattr(self.doc, "_mmap_mode", False) else ""
+        mmap_note = " (mmap, read-only)" if self._mmap_readonly else ""
         self.statusBar().showMessage(
             f"Opened: {path} ({size_mb:.1f} MiB{mmap_note}) — {summary}"
         )
 
-    def _file_summary(self, path: str) -> str:
-        try:
-            with open_gph_buffer(path) as data:
-                return self._summarize_buffer(data)
-        except OSError:
-            return ""
+    def closeEvent(self, event):
+        self.doc.close()
+        super().closeEvent(event)
 
     def _summarize_buffer(self, data) -> str:
         parts = []
@@ -221,8 +222,17 @@ class GphViewerMain(QMainWindow):
             if links.get("conn_split"):
                 parts.append("conn_split")
         pmeta = parse_ls_parts(data)
-        if pmeta:
+        cvol = parse_ls_cvol_ids(data)
+        n_cells = links["n_cells"] if links else (len(cvol) if cvol is not None else 0)
+        if pmeta and cvol is not None and len(cvol) == n_cells:
+            for pname, cv in pmeta:
+                n = int((cvol == cv).sum())
+                parts.append(f"{pname}={n}")
+        elif pmeta:
             parts.append(f"{len(pmeta)} parts")
+        regions = parse_ls_string_list(data, "LS_VolumeRegions")
+        if regions:
+            parts.append(f"vol_regions={len(regions)}")
         return ", ".join(parts) if parts else "structure only"
 
     def _build_tree(self):
@@ -285,6 +295,10 @@ class GphViewerMain(QMainWindow):
                 lines.append(f"Value: {node.value}")
         if node.modified:
             lines.append("\n(Modified)")
+        extra = self._extra_node_lines(node)
+        if extra:
+            lines.append("")
+            lines.extend(extra)
         self.attrs_text.setPlainText("\n".join(lines))
 
         # Data tab (table for arrays)
@@ -355,6 +369,38 @@ class GphViewerMain(QMainWindow):
             self.edit_input.setEnabled(False)
             self.edit_input.clear()
             self.apply_btn.setEnabled(False)
+
+    def _extra_node_lines(self, node: GphNode) -> list[str]:
+        """Partition / topology details aligned with gph2cgns diagnostics."""
+        data = self.doc._raw_data
+        lines: list[str] = []
+
+        if node.name == "LS_CvolIdOfElements":
+            cvol = parse_ls_cvol_ids(data)
+            if cvol is not None:
+                lines.append(f"Per-cell array length: {len(cvol)}")
+                for pname, cv in parse_ls_parts(data):
+                    lines.append(f"  {pname} (cvol_id={cv}): {int((cvol == cv).sum())} cells")
+
+        if node.name == "LS_Links":
+            summary = parse_ls_links_summary(data)
+            if summary:
+                if summary.get("conn_split"):
+                    lines.append(
+                        f"conn split: {summary.get('conn_got', '?')}/"
+                        f"{summary.get('conn_entries', '?')} entries"
+                    )
+                lines.append(
+                    f"npe range: [{summary['npe_min']}..{summary['npe_max']}]"
+                )
+
+        if node.name == "LS_Parts":
+            cvol = parse_ls_cvol_ids(data)
+            if cvol is not None:
+                for pname, cv in parse_ls_parts(data):
+                    lines.append(f"  {pname}: cvol_id={cv}, cells={int((cvol == cv).sum())}")
+
+        return lines
 
     def on_table_cell_changed(self, item: QTableWidgetItem):
         # Vertex / topology / partition arrays are read-only in the viewer.
@@ -433,6 +479,13 @@ class GphViewerMain(QMainWindow):
             QMessageBox.critical(self, "Error", "Failed to save")
 
     def on_save_as(self):
+        if self._mmap_readonly:
+            QMessageBox.warning(
+                self, "Read-only",
+                "This file was opened via memory-map (large GPH). "
+                "Save As is not supported without loading the full file into RAM.",
+            )
+            return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save GPH As",

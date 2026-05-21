@@ -191,6 +191,23 @@ def iter_data_blocks(data: bytes, sec_start: int, sec_end: int):
         pos = payload_end + 4
 
 
+def parse_ls_cvol_ids(data: bytes) -> Optional["np.ndarray"]:
+    """Parse LS_CvolIdOfElements -> I4[n_cells] (largest I4 block in section)."""
+    sec_start = find_section(data, "LS_CvolIdOfElements")
+    if sec_start < 0:
+        return None
+    sec_end = section_end(data, sec_start)
+    best: Optional[tuple[int, int]] = None
+    for p, bc in iter_data_blocks(data, sec_start, sec_end):
+        if bc % 4 == 0 and bc >= 4:
+            if best is None or bc > best[1]:
+                best = (p, bc)
+    if best is None:
+        return None
+    p, bc = best
+    return np.frombuffer(data, dtype=">i4", count=bc // 4, offset=p).astype(np.int64).copy()
+
+
 def parse_ls_nodes_vertices(
     data: bytes,
     max_preview: int = 3,
@@ -553,16 +570,16 @@ class GphDocument:
         file_data = self._raw_data
 
         if name == "LS_CvolIdOfElements":
-            arr = self._read_i4_array_after_label(raw)
-            if arr is None:
+            cvol_arr = parse_ls_cvol_ids(file_data)
+            if cvol_arr is None:
                 return GphNode(name, offset, len(raw), "I4[]",
                                value=None, raw=raw, children=[])
-            unique_cv = sorted(set(arr))
+            unique_cv = sorted({int(x) for x in np.unique(cvol_arr[:min(len(cvol_arr), 1_000_000)])})
             summary = (
-                f"I4[{len(arr)}] cvol_ids={unique_cv[:12]}"
+                f"I4[{len(cvol_arr)}] cvol_ids={unique_cv[:12]}"
                 f"{'...' if len(unique_cv) > 12 else ''}"
             )
-            preview = arr[:1000] if len(arr) > 1000 else arr
+            preview = cvol_arr[:1000].tolist()
             return GphNode(name, offset, len(raw), summary,
                            value=preview, raw=raw, children=[])
 
