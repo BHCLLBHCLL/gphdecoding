@@ -220,7 +220,10 @@ class GphViewerMain(QMainWindow):
             if links.get("polyhedral"):
                 parts.append("polyhedral")
             if links.get("conn_split"):
-                parts.append("conn_split")
+                chunks = links.get("conn_chunks", 2)
+                parts.append(f"conn_split×{chunks}")
+            elif not links.get("conn_complete", True):
+                parts.append("conn_INCOMPLETE")
         pmeta = parse_ls_parts(data)
         cvol = parse_ls_cvol_ids(data)
         n_cells = links["n_cells"] if links else (len(cvol) if cvol is not None else 0)
@@ -388,6 +391,12 @@ class GphViewerMain(QMainWindow):
                 if summary.get("conn_split"):
                     lines.append(
                         f"conn split: {summary.get('conn_got', '?')}/"
+                        f"{summary.get('conn_entries', '?')} entries "
+                        f"({summary.get('conn_chunks', '?')} chunks)"
+                    )
+                elif not summary.get("conn_complete", True):
+                    lines.append(
+                        f"conn INCOMPLETE: {summary.get('conn_got', '?')}/"
                         f"{summary.get('conn_entries', '?')} entries"
                     )
                 lines.append(

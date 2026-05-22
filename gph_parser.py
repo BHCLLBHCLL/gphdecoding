@@ -124,7 +124,7 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
 def _section_blurb(name: str) -> str:
     blurbs = {
         "LS_CvolIdOfElements": "I4[n_cells] per-cell cvol_id (opaque Part id, not list index)",
-        "LS_Links": "face topology: owner, neighbor, npe, conn (CSR; may split >1 GiB)",
+        "LS_Links": "face topology: owner, neighbor, npe, conn (CSR; may split >1 GiB, multi-chunk)",
         "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
         "LS_SurfaceRegions": "named BC regions -> global face id lists",
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
@@ -186,13 +186,28 @@ def format_description() -> str:
 
   Pure-triangle meshes: all npe=3.  Mixed/polyhedral (e.g. tr03.gph):
   npe varies (3..11+).  Voxel meshes (laptop_simplified_voxel_v4.gph) use
-  npe in {4,5,6,7} with ~10^7 faces and ~10^7 cells.
+  npe in {4,5,6,7} with ~10^7 faces and ~10^7 cells.  Denser meshes
+  (laptop_simplified_denser_v2_gph.gph, ~5.9 GiB) reach ~10^8 faces.
 
   Large conn arrays (>~1 GiB): when sum(npe)*4 exceeds a single payload
-  limit (~1073741824 bytes), the conn data is split:
-    [12, bc1][conn part 1][bc1]  then  [I4=bc2][conn part 2 raw...]
-  The continuation uses a bare I4 byte_count (no [I4=12] header tag).
-  gph2cgns / gph_model concatenate both parts before CSR indexing.
+  limit (~1073741824 bytes), scFLOW splits conn into multiple segments:
+
+    [12, bc1][conn part 1][bc1]              <- standard block (bc1 often 1 GiB)
+    [I4=1073741824][conn part 2 raw...]      <- bare byte_count + payload (no [I4=12])
+    ... further 1 GiB bare chunks as needed ...
+    [I4=bcN][conn final raw...]              <- last chunk; bcN may repeat 1 GiB
+                                               marker with a shorter payload
+
+  Conn block selection: if no block matches sum(npe) exactly, pick the
+  largest non-triple I4 block with byte_count >= 12 (not 3*n_faces*4, which
+  fails when the first conn segment is capped at 1 GiB on polyhedral meshes).
+
+  gph2cgns / gph_model concatenate all segments before CSR indexing.
+  parse_ls_links_summary reports conn_got, conn_chunks and conn_complete.
+
+  Examples:
+    laptop_simplified_voxel_v4.gph  - 2 conn chunks (~1.44 GiB total)
+    laptop_simplified_denser_v2_gph.gph - 3 conn chunks (~2.05 GiB total)
 
   Files >512 MiB: gph2cgns, gph_parser and gphviewer memory-map the file
   instead of loading it entirely into RAM.

@@ -12,6 +12,7 @@ from typing import Any, Optional
 import numpy as np
 
 _LARGE_GPH_BYTES = 512 * 1024 * 1024  # mmap threshold (see gph2cgns.parse_gph_mesh)
+_CONN_CHUNK_BYTES = 1073741824  # 1 GiB cap per LS_Links conn payload block
 
 
 def read_i32_be(data: bytes, pos: int) -> int:
@@ -90,9 +91,90 @@ def _f64_wr_array(buf, offset: int, count: int) -> np.ndarray:
     return bits.view(">f8").astype(np.float64)
 
 
+def _read_conn_continuations(data, pos: int, sec_end: int, got: int,
+                             expected: int,
+                             conn_parts: Optional[list] = None) -> tuple[int, int, int]:
+    """Read conn split continuations after the primary conn block.
+
+    Very large meshes cap each conn payload at 1 GiB.  Continuation blocks use
+    bare ``[I4=byte_count][payload]`` (no ``[I4=12]`` header).  Multiple full
+    1 GiB chunks may appear; the final chunk may repeat the 1 GiB marker with
+    a shorter payload (e.g. ``laptop_simplified_denser_v2_gph.gph``).
+
+    Returns ``(new_got, final_pos, n_continuation_chunks)``.
+    """
+    n_continuations = 0
+    while got < expected and pos + 4 <= sec_end:
+        need_bytes = (expected - got) * 4
+        bare_bc = read_i32_be(data, pos)
+
+        if (bare_bc == _CONN_CHUNK_BYTES
+                and pos + 4 + _CONN_CHUNK_BYTES <= sec_end):
+            n = _CONN_CHUNK_BYTES // 4
+            if conn_parts is not None:
+                conn_parts.append(
+                    np.frombuffer(data, dtype=">u4", count=n, offset=pos + 4)
+                    .astype(np.int64).copy())
+            got += n
+            pos += 4 + _CONN_CHUNK_BYTES
+            n_continuations += 1
+            continue
+
+        if (bare_bc == _CONN_CHUNK_BYTES
+                and pos + 4 + need_bytes <= sec_end):
+            n = need_bytes // 4
+            if conn_parts is not None:
+                conn_parts.append(
+                    np.frombuffer(data, dtype=">u4", count=n, offset=pos + 4)
+                    .astype(np.int64).copy())
+            got += n
+            n_continuations += 1
+            break
+
+        if (bare_bc == need_bytes
+                and pos + 4 + need_bytes <= sec_end):
+            n = need_bytes // 4
+            if conn_parts is not None:
+                conn_parts.append(
+                    np.frombuffer(data, dtype=">u4", count=n, offset=pos + 4)
+                    .astype(np.int64).copy())
+            got += n
+            n_continuations += 1
+            break
+
+        if (bare_bc >= need_bytes and bare_bc % 4 == 0
+                and pos + 4 + bare_bc <= sec_end):
+            n = bare_bc // 4
+            if conn_parts is not None:
+                conn_parts.append(
+                    np.frombuffer(data, dtype=">u4", count=n, offset=pos + 4)
+                    .astype(np.int64).copy())
+            got += n
+            pos += 4 + bare_bc
+            n_continuations += 1
+            continue
+
+        if read_i32_be(data, pos) == 12 and pos + 8 <= sec_end:
+            bc2 = read_i32_be(data, pos + 4)
+            if (bc2 > 0 and bc2 % 4 == 0
+                    and pos + 8 + bc2 + 4 <= sec_end
+                    and read_i32_be(data, pos + 8 + bc2) == bc2):
+                n = bc2 // 4
+                if conn_parts is not None:
+                    conn_parts.append(
+                        np.frombuffer(data, dtype=">u4", count=n, offset=pos + 8)
+                        .astype(np.int64).copy())
+                got += n
+                pos += 8 + bc2 + 4
+                n_continuations += 1
+                continue
+        break
+    return got, pos, n_continuations
+
+
 def _conn_payload_size(data, blocks, triples, conn_total_expected: int,
-                       sec_end: int) -> tuple[int, bool]:
-    """Return (conn_entry_count, split) for the LS_Links conn array."""
+                       sec_end: int) -> tuple[int, bool, int]:
+    """Return ``(conn_entry_count, split, n_chunks)`` for the LS_Links conn array."""
     conn_block = None
     for p, bc in blocks:
         if (p, bc) in triples:
@@ -100,36 +182,24 @@ def _conn_payload_size(data, blocks, triples, conn_total_expected: int,
         if bc % 4 != 0:
             continue
         if bc // 4 == conn_total_expected:
-            return conn_total_expected, False
+            return conn_total_expected, False, 1
         if bc < 12:
             continue
         if conn_block is None or bc > conn_block[1]:
             conn_block = (p, bc)
     if conn_block is None:
-        return 0, False
+        return 0, False, 0
     conn_p, conn_bc = conn_block
     got = conn_bc // 4
     if got >= conn_total_expected:
-        return conn_total_expected, False
+        return conn_total_expected, False, 1
     pos = conn_p + conn_bc + 4
-    while got < conn_total_expected and pos + 4 <= sec_end:
-        need_bytes = (conn_total_expected - got) * 4
-        bare_bc = read_i32_be(data, pos)
-        if (bare_bc >= need_bytes and bare_bc % 4 == 0
-                and pos + 4 + bare_bc <= sec_end):
-            got += bare_bc // 4
-            pos += 4 + bare_bc
-            continue
-        if read_i32_be(data, pos) == 12:
-            bc2 = read_i32_be(data, pos + 4)
-            if (bc2 > 0 and bc2 % 4 == 0
-                    and pos + 8 + bc2 + 4 <= sec_end
-                    and read_i32_be(data, pos + 8 + bc2) == bc2):
-                got += bc2 // 4
-                pos += 8 + bc2 + 4
-                continue
-        break
-    return got, got >= conn_total_expected and got > conn_bc // 4
+    got, _, n_extra = _read_conn_continuations(
+        data, pos, sec_end, got, conn_total_expected,
+    )
+    n_chunks = 1 + n_extra if n_extra else 1
+    split = got >= conn_total_expected and got > conn_bc // 4
+    return got, split, n_chunks
 
 
 # ── Shared section scanners (aligned with gph2cgns.py) ───────────────────────
@@ -300,7 +370,7 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
     boundary = int((neigh_raw == 0xFFFFFFFF).sum())
     owner = np.frombuffer(data, dtype=">u4", count=n_faces, offset=owner_p)
     n_cells = int(owner.max()) + 1
-    conn_got, conn_split = _conn_payload_size(
+    conn_got, conn_split, conn_chunks = _conn_payload_size(
         data, blocks, triples, conn_total, sec_end,
     )
     return {
@@ -312,6 +382,8 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
         "conn_entries": conn_total,
         "conn_got": conn_got,
         "conn_split": conn_split,
+        "conn_chunks": conn_chunks,
+        "conn_complete": conn_got >= conn_total,
         "polyhedral": int(npe.max()) > 3,
     }
 
@@ -599,7 +671,9 @@ class GphDocument:
                     f"BC={summary['boundary_faces']} "
                     f"npe=[{summary['npe_min']}..{summary['npe_max']}]"
                     + (" polyhedral" if summary["polyhedral"] else "")
-                    + (" conn_split" if summary.get("conn_split") else "")
+                    + (f" conn_split×{summary['conn_chunks']}"
+                       if summary.get("conn_split") else "")
+                    + (" conn_INCOMPLETE" if not summary.get("conn_complete", True) else "")
                 )
                 return GphNode(name, offset, len(raw), "topology", value=val,
                                raw=raw, children=[])

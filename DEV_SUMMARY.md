@@ -690,7 +690,8 @@ Error: could not extract mesh data from GPH.
 
 | 改动 | 说明 |
 |------|------|
-| conn 续接 | 主块不足时读取裸 `byte_count` + raw 续块（亦支持标准 `[12,bc]` 块） |
+| conn 续接 | 主块不足时**循环**读取裸 `byte_count` + raw 续块（支持多个 1 GiB 段及末段短 payload；亦支持标准 `[12,bc]` 块） |
+| conn 块选择 | fallback 取最大非 triple 块（`bc >= 12`），勿用 `3×n_faces×4` 阈值 |
 | 坐标读取 | `np.frombuffer` 批量读三轴 float64 |
 | 大文件 I/O | `>512 MiB` 使用 **mmap**（`parse_gph_mesh` / `open_gph_buffer` / `GphDocument.load`） |
 | 面→单元映射 | 88M 面 `argsort` 分组，替代 Python 循环 |
@@ -711,9 +712,9 @@ Zones    : 4  (FluidRegion + out_air + rotation1 + rotation2)
 | 文件 | 同步内容 |
 |------|----------|
 | `gph2cgns.py` | conn 续接、mmap、frombuffer、向量化 cell-face 映射 |
-| `gph_model.py` | `open_gph_buffer`、conn 分块检测、`parse_ls_links_summary` / `parse_ls_nodes_vertices` 对齐 |
-| `gph_parser.py` | mmap 解析、format 文本补充 conn 分块 |
-| `gphviewer.py` | 大文件 mmap 打开、只读提示、状态栏 mesh 摘要 |
+| `gph_model.py` | `open_gph_buffer`、`_read_conn_continuations`、conn 分块检测、`parse_ls_links_summary`（含 `conn_chunks`） |
+| `gph_parser.py` | mmap 解析、format 文本补充多段 conn 分块 |
+| `gphviewer.py` | 大文件 mmap 打开、状态栏 `conn_split×N` / `conn_INCOMPLETE` 提示 |
 | `GPH_FORMAT_SPEC.md` | §5.2 conn 分块、§6.1 超大文件 |
 | `DEV_SUMMARY.md` | 本节 |
 
@@ -733,3 +734,31 @@ Zones    : 4  (FluidRegion + out_air + rotation1 + rotation2)
 | fan2.fan1.rotation2 | 6 697 048 |
 
 ZoneBC 中 `out_air` 的 `impeller1_s` / `impeller2_s` PointList 恢复为空。
+
+### 11.7 多段 conn 续接 + conn 块选择（denser v2）
+
+**问题**：`laptop_simplified_denser_v2_gph.gph`（磁盘 **~5.9 GiB**）同样报 `LS_Links parse failed`。
+
+**根因（两处）**：
+
+1. **conn 块 fallback 阈值过严**：旧代码要求 `bc >= 3×n_faces×4`（纯三角下界）。该文件 `n_faces=114M`，下界 ~1.27 GiB，而首段 conn 仅 **1 GiB**，被跳过 → `conn_block=None`。
+2. **仅支持单段续接**：v4 只需 1 次裸续接；denser 需 **2 次**裸续接（第二段完整 1 GiB + 第三段带重复 1 GiB 标记的短 payload）。
+
+**修复**：
+
+| 改动 | 说明 |
+|------|------|
+| conn 块选择 | fallback 改为 `bc >= 12`，取最大非 triple 块 |
+| `_read_conn_continuations` | 循环读取多个 1 GiB 裸块；末段识别「1 GiB 标记 + 短 payload」 |
+| 摘要字段 | `parse_ls_links_summary` 增加 `conn_chunks`、`conn_complete` |
+
+**验证（denser v2）**：
+
+```
+Vertices : 83664081
+Faces    : 114039102  (polyhedral)
+Cells    : 20687038
+conn     : 549000094 entries in 3 chunks
+```
+
+解析 ~9 min（mmap + frombuffer）。

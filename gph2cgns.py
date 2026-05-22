@@ -19,6 +19,8 @@ from typing import Optional
 
 import numpy as np
 
+from gph_model import _read_conn_continuations
+
 try:
     import h5py
 except ImportError:
@@ -336,13 +338,14 @@ def _parse_ls_links(data: bytes):
             break
     if conn_block is None:
         # Fall back: pick the largest remaining block (handles legacy files
-        # whose conn byte-count includes trailing sentinel padding).
+        # whose conn byte-count includes trailing sentinel padding, and meshes
+        # whose conn array is split into 1 GiB chunks with sum(npe) > 1 GiB).
         for p, bc in blocks:
             if (p, bc) in triples:
                 continue
             if bc % 4 != 0:
                 continue
-            if bc < 3 * n_faces * 4:
+            if bc < 12:
                 continue
             if conn_block is None or bc > conn_block[1]:
                 conn_block = (p, bc)
@@ -357,41 +360,10 @@ def _parse_ls_links(data: bytes):
     got = int(conn_parts[0].size)
 
     if got < conn_total_expected:
-        # Very large meshes (e.g. laptop_simplified_voxel_v4.gph) split the
-        # conn array when a single payload would exceed ~1 GiB.  The primary
-        # block is followed by a bare I4 byte_count and a raw continuation
-        # payload (no [I4=12] header tag).
         pos = conn_p + conn_bc + 4
-        while got < conn_total_expected and pos + 4 <= sec_end:
-            need_bytes = (conn_total_expected - got) * 4
-
-            bare_bc = read_i32_be(data, pos)
-            if (bare_bc >= need_bytes
-                    and bare_bc % 4 == 0
-                    and pos + 4 + bare_bc <= sec_end):
-                chunk = np.frombuffer(
-                    data, dtype=">u4", count=bare_bc // 4, offset=pos + 4
-                ).astype(np.int64).copy()
-                conn_parts.append(chunk)
-                got += int(chunk.size)
-                pos += 4 + bare_bc
-                continue
-
-            if (read_i32_be(data, pos) == 12
-                    and pos + 8 <= sec_end):
-                bc2 = read_i32_be(data, pos + 4)
-                if (bc2 > 0 and bc2 % 4 == 0
-                        and pos + 8 + bc2 + 4 <= sec_end
-                        and read_i32_be(data, pos + 8 + bc2) == bc2):
-                    chunk = np.frombuffer(
-                        data, dtype=">u4", count=bc2 // 4, offset=pos + 8
-                    ).astype(np.int64).copy()
-                    conn_parts.append(chunk)
-                    got += int(chunk.size)
-                    pos += 8 + bc2 + 4
-                    continue
-            break
-
+        got, _ = _read_conn_continuations(
+            data, pos, sec_end, got, conn_total_expected, conn_parts,
+        )
         if got < conn_total_expected:
             return None
         conn = np.concatenate(conn_parts)[:conn_total_expected]

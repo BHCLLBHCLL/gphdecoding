@@ -119,14 +119,18 @@ CSR 索引：`face_offsets[0]=0`，`face_offsets[i+1]=face_offsets[i]+npe[i]`；
 
 #### 超大 conn 分块（>~1 GiB）
 
-当 `sum(npe) × 4` 超过单个数据块约 **1 GiB**（`1073741824` 字节）时，scFLOW 将 `conn` 拆成两段：
+当 `sum(npe) × 4` 超过单个数据块约 **1 GiB**（`1073741824` 字节）时，scFLOW 将 `conn` 拆成**多段**：
 
 ```
 [12, bc1][conn 第 1 段 payload][bc1]   ← 标准块（bc1 常为 1073741824）
-[I4=bc2][conn 第 2 段 raw payload]     ← 裸 byte_count + 数据，无 [I4=12] 头
+[I4=1073741824][conn 第 2 段 raw...]  ← 裸 byte_count + 数据，无 [I4=12] 头
+... 可重复多个完整 1 GiB 裸块 ...
+[I4=bcN][conn 末段 raw...]             ← 末段；bcN 可能仍为 1 GiB 标记但 payload 更短
 ```
 
-实测 `laptop_simplified_voxel_v4.gph`（~3.7 GiB）：
+**conn 块选择**：若无块字节数恰好等于 `sum(npe)×4`，取除 owner/neighbor/npe 三数组外 **byte_count 最大且 ≥ 12** 的 I4 块（勿用 `3×n_faces×4` 作下界——多面体网格首段 conn 常被 cap 在 1 GiB）。
+
+实测 `laptop_simplified_voxel_v4.gph`（~3.7 GiB，**2 段** conn）：
 
 | 项目 | 数值 |
 |------|------|
@@ -136,7 +140,19 @@ CSR 索引：`face_offsets[0]=0`，`face_offsets[i+1]=face_offsets[i]+npe[i]`；
 | conn 第 1 段 | 268,435,456 条目（1 GiB） |
 | conn 第 2 段 | 92,499,282 条目（~370 MiB） |
 
-`gph2cgns.py` / `gph_model.py` 在主块之后自动读取裸 `byte_count` 续接块并拼接后再做 CSR 索引。**旧版解析器在 `conn 块 < sum(npe)` 时直接失败**（报 `LS_Links parse failed`）。
+实测 `laptop_simplified_denser_v2_gph.gph`（~5.9 GiB，**3 段** conn）：
+
+| 项目 | 数值 |
+|------|------|
+| 面数 | 114,039,102 |
+| 单元数 | 20,687,038 |
+| 顶点数 | 83,664,081 |
+| `sum(npe)` | 549,000,094 |
+| conn 第 1 段 | 268,435,456 条目（1 GiB，标准块） |
+| conn 第 2 段 | 268,435,456 条目（1 GiB，裸续接） |
+| conn 第 3 段 | 12,129,182 条目（~48 MiB，末段） |
+
+`gph2cgns.py` / `gph_model.py` 在主块之后循环读取裸 `byte_count` 续接块（亦支持标准 `[12,bc]` 块）并拼接后再做 CSR 索引。`gph_parser.py` / `gphviewer.py` 通过 `parse_ls_links_summary` 报告 `conn_got`、`conn_chunks`、`conn_complete`。**旧版解析器在 conn 块选错或续接不完整时直接失败**（报 `LS_Links parse failed`）。
 
 纯三角 legacy 文件可能使用列主序 conn；`gph2cgns` 根据块大小与 `sum(npe)` 自动判别。
 
@@ -220,6 +236,8 @@ UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_path
 `gph2cgns.py`、`gph_parser.py`、`gphviewer.py`（`GphDocument.load`）对超过 **512 MiB** 的文件使用 **内存映射（mmap）**，避免整文件读入 RAM。坐标与 conn 数组通过 `numpy.frombuffer` 批量读取。
 
 `laptop_simplified_voxel_v4.gph` 转换参考：解析 ~5 分钟，完整 CGNS 写出 ~16 分钟（输出约 14 GiB）。
+
+`laptop_simplified_denser_v2_gph.gph`（~5.9 GiB，conn 三段 ~2.05 GiB）：解析 ~9 分钟。
 
 ## 7. 使用 Python 解析
 
