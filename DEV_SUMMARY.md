@@ -13,6 +13,7 @@
 9. [第四阶段：HDF5 superblock 版本与 ANSA 兼容性](#9-第四阶段hdf5-superblock-版本与-ansa-兼容性)
 10. [第五阶段：多 Zone 分区、多面体网格与命名 BC](#10-第五阶段多-zone-分区多面体网格与命名-bc)
 11. [第六阶段：超大 GPH（conn 分块 + mmap）](#11-第六阶段超大-gphconn-分块--mmap)
+12. [后续方向：Zone/BC 命名去硬编码](#12-后续方向zonebc-命名去硬编码)
 
 ---
 
@@ -711,7 +712,7 @@ Zones    : 4  (FluidRegion + out_air + rotation1 + rotation2)
 
 | 文件 | 同步内容 |
 |------|----------|
-| `gph2cgns.py` | conn 续接、mmap、frombuffer、向量化 cell-face 映射 |
+| `gph2cgns.py` | conn 续接（从 `gph_model` 导入）、mmap、frombuffer、向量化 cell-face 映射 |
 | `gph_model.py` | `open_gph_buffer`、`_read_conn_continuations`、conn 分块检测、`parse_ls_links_summary`（含 `conn_chunks`） |
 | `gph_parser.py` | mmap 解析、format 文本补充多段 conn 分块 |
 | `gphviewer.py` | 大文件 mmap 打开、状态栏 `conn_split×N` / `conn_INCOMPLETE` 提示 |
@@ -762,3 +763,130 @@ conn     : 549000094 entries in 3 chunks
 ```
 
 解析 ~9 min（mmap + frombuffer）。
+
+### 11.8 `_read_conn_continuations` 返回值不同步（voxel v6）
+
+**问题**：`laptop_simplified_voxel_v6.gph`（磁盘 **~4.9 GiB**）转换时在 `_parse_ls_links` 崩溃：
+
+```
+ValueError: too many values to unpack (expected 2)
+```
+
+**根因**：§11.7 将 `gph_model._read_conn_continuations` 扩展为返回 `(got, pos, n_continuations)` 三元组，但 `gph2cgns.py` 仍写 `got, _ = ...`（只解包两个值）。
+
+**修复**：`gph2cgns.py` 改为 `got, _, _ = _read_conn_continuations(...)`。conn 续接逻辑本身对 v6 已适用（2 段 conn，~1.91 GiB）。
+
+**验证（voxel v6）**：
+
+```
+Vertices : 48526564
+Faces    : 126318473  (polyhedral, npe 4..7)
+Cells    : 38895916
+conn     : 513041554 entries in 2 chunks
+```
+
+解析 ~8 min。
+
+---
+
+## 12. 后续方向：Zone/BC 命名去硬编码
+
+> **状态**：待实施（2026-05-23 代码审查结论）。  
+> **范围**：`gph2cgns.py` 中与 Volume Zone / Part Zone / Boundary（BC）相关的命名与分区逻辑。  
+> **说明**：注释中出现的 `inlet`、`fan2.fan1` 等仅为文档示例，不参与运行时逻辑；本节只列**实际影响输出 CGNS 名称**的写死或半写死逻辑。
+
+### 12.1 问题概览
+
+当前转换器在 mesh 拓扑解析（`LS_Nodes` / `LS_Links` / conn 分块）上已基本数据驱动，但 **Zone 规划与 BC 命名**仍大量依赖从少数参考文件（`box_ansa`、`tr03`、`laptop_simplified_voxel_*`）归纳的启发式规则。新 GPH 项目在 assembly 结构或 Volume Region 命名与参考不一致时，可能出现：
+
+- Zone 名称与 FLDUTIL 参考 CGNS 不符；
+- 某 Zone 的 cell 掩码静默回退为全网格（分区错误但无报错）；
+- 无 `LS_SurfaceRegions` 时 BC 名固定为 `box_surfs`。
+
+### 12.2 写死嫌疑位置清单
+
+#### A. Volume Region / Zone 名称（高风险）
+
+| 位置（`gph2cgns.py`） | 写死/半写死内容 | 风险 |
+|----------------------|-----------------|------|
+| `_classify_zone_cells` L708–709 | `"FluidRegion"` 作为全网格 magic name | 非标准 Volume Region 名无法识别 |
+| `_build_zone_plan` L1304, L1313–1314 | 自动 insert / 补全 `"FluidRegion"` | 与 GPH 内实际区域名可能不一致 |
+| `_build_zone_plan` L1305 | `"FPHPARTS.box_vol"` fallback | Part 名硬编码，仅适用 box 类样本 |
+| `_classify_zone_cells` L717–721 | `"@VPartRegion_"` 前缀模式 | 只覆盖一种 Volume Region 命名约定 |
+| `_classify_zone_cells` L724–728 | `"FPHPARTS."` 前缀解析 | Part 名提取规则绑定 vendor 约定 |
+| `_classify_zone_cells` L730–738 | Zone 名**子串**匹配 Part 名（取最长） | 易误匹配（如 `air` vs `air_domain` / `out_air`） |
+| `_classify_zone_cells` L710–711, L738 | 无法识别时 `return all_mask` | 分区失败被掩盖，Zone 含全部 cell |
+| `_zone_name_for_part` L1354–1356 | `depth >= 2` 不加前缀，否则 `FPHPARTS.{path}` | 命名阈值来自少数样本 |
+| CLI L1469, L1504 | `--single-zone` 默认 `"FluidRegion"` | 默认输出名写死 |
+
+#### B. Assembly / Part 路径启发式（间接影响 Zone 名）
+
+| 位置 | 写死/半写死内容 | 风险 |
+|------|-----------------|------|
+| `_parse_ls_assemblies` L653–676 | 取第一个顶层 assembly 下前 N 个「空」assembly 作 `root_empty_prefix` | 规则来自 laptop（`fan2.fan1`），其他 XML 结构可能错 |
+| `_zone_name_for_part` L1344–1345 | root-level Part 使用 `root_empty_prefix.{part}` | 同上 |
+
+#### C. Boundary / Surface 名称（中风险）
+
+| 位置 | 写死/半写死内容 | 风险 |
+|------|-----------------|------|
+| `_write_zone` L1235–1241 | 无 `LS_SurfaceRegions` 时 BC 名 `"box_surfs"` | 仅适合 box 测试文件 |
+| `_parse_ls_surface_regions` + `_bc_families_for_zone` | **运行时未写死**具体 BC 名（良好） | BC 名来自 GPH；但所有 Zone 仍 emit 全量 region 名（FLDUTIL 布局约定） |
+
+#### D. CLI / 默认值（低风险）
+
+| 位置 | 内容 | 说明 |
+|------|------|------|
+| CLI L1460 | 默认输入 `"box.gph"` | 不影响转换逻辑 |
+| `write_cgns` L1425 | `"Software Cradle FLDUTIL"` | CGNS ReferenceState，非区域名 |
+
+#### E. CGNS 格式固定字段（一般保留）
+
+`"Null"`、`"FaceCenter"`、`"CellCenter"`、`"Unstructured"` 及 HDF5/CGNS 节点名属于格式约定，通常不随 mesh 变化，**不建议作为本轮去硬编码目标**。
+
+### 12.3 修改优先级
+
+| 优先级 | 位置 | 问题 | 建议方向 |
+|--------|------|------|----------|
+| **P0** | `_build_zone_plan` L1305 | `box_vol` 写死 | 改为 `FPHPARTS.{parts_with_cvol[0][0]}` 或第一个 Part 实际名 |
+| **P0** | `_classify_zone_cells` L738 | 失败回退全网格 | 区分「故意全网格」与「解析失败」；失败时 warning 或空 mask |
+| **P1** | `_classify_zone_cells` L730–737 | 子串匹配误分区 | 精确/后缀匹配优先；多匹配时 warning |
+| **P1** | `_zone_name_for_part` | `FPHPARTS`/depth 启发式 | 策略配置化 + golden test 对照 FLDUTIL |
+| **P2** | `_parse_ls_assemblies` | `root_empty_prefix` laptop 规则 | 可配置或从 GPH/XML 显式字段推导 |
+| **P2** | `_write_zone` L1241 | `box_surfs` | CLI `--default-bc-name` 或通用名 `Boundary` |
+| **P3** | 多处 `FluidRegion` | magic name | 抽常量；优先读 `LS_VolumeRegions` 首项 |
+
+### 12.4 建议架构（实施阶段参考）
+
+1. **命名策略模块**  
+   新增 `ZoneNamingPolicy` / `BcNamingPolicy`，将 FLDUTIL 启发式与 GPH 元数据解析分离；`gph2cgns.py` 只调用策略接口。
+
+2. **配置层**  
+   支持 YAML/JSON 或 CLI 覆盖：
+   - `FPHPARTS` 前缀字符串；
+   - 默认全网格 Zone 名（当前 `FluidRegion`）；
+   - Part Zone depth 阈值（当前 `>= 2` 用 raw path）；
+   - 无 SurfaceRegions 时的默认 BC 名；
+   - `root_empty_prefix` 推导模式（`auto` / `none` / 显式字符串）。
+
+3. **校验与报告层**  
+   转换前/后输出 Zone plan 摘要：`LS_VolumeRegions` / `LS_Parts` / `LS_SurfaceRegions` 与将写入 CGNS 的 Zone/BC 名对照；未识别 Zone 名、cell 掩码为全网格但非 `FluidRegion` 等情况打 warning。
+
+4. **Golden tests**  
+   对 `box_ansa`、`tr03`、`laptop_simplified_voxel_v4/v6`、`laptop_simplified_denser_v2_gph` 等样本，除 cell 数外断言 **Zone 名列表、BC 族名列表** 与参考 CGNS（`*_orig.cgns`）一致。
+
+5. **命名模式扩展**  
+   `@VPartRegion_` 等已知前缀放入可扩展列表或正则配置，便于后续发现新 scFLOW 命名约定时只改配置不改核心逻辑。
+
+### 12.5 非目标（本轮不改动）
+
+- CGNS/HDF5 节点结构与属性名（`GridCoordinates`、`ZoneBC`、`FlowSolution` 等）；
+- `LS_SurfaceRegions` 已从 GPH 动态读取 BC 名的主路径；
+- mesh 拓扑解析（conn 分块、mmap、cvol_id 最大块选择等，见 §11）。
+
+### 12.6 验收标准（实施后）
+
+- [ ] 无 `LS_VolumeRegions` / `LS_Parts` 的 GPH 不再输出硬编码 `FPHPARTS.box_vol`（除非 CLI 显式指定）；
+- [ ] `_classify_zone_cells` 无法匹配时 CLI 有明确 warning，且不 silently 全网格（除 `FluidRegion` 等白名单 Zone）；
+- [ ] 现有参考样本（box_ansa、tr03、laptop_v4/v6）Zone/BC **名称**与 `*_orig.cgns` 仍 byte-level 或列表级一致；
+- [ ] 命名策略可通过配置文件切换，无需改 `gph2cgns.py` 核心逻辑。

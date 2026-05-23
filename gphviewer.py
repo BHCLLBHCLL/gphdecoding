@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 GPH Viewer - PyQt GUI to browse and edit GPH binary files (similar to HDFView).
+
+Large meshes (e.g. laptop_simplified_voxel_v4/v6.gph, laptop_simplified_denser_v2_gph.gph)
+are opened via mmap; LS_Links conn split status is shown in the status bar
+(conn_split×N from parse_ls_links_summary).
 """
 
 import struct

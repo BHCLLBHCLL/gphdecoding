@@ -188,6 +188,7 @@ def format_description() -> str:
   npe varies (3..11+).  Voxel meshes (laptop_simplified_voxel_v4.gph) use
   npe in {4,5,6,7} with ~10^7 faces and ~10^7 cells.  Denser meshes
   (laptop_simplified_denser_v2_gph.gph, ~5.9 GiB) reach ~10^8 faces.
+  laptop_simplified_voxel_v6.gph (~4.9 GiB) has ~10^8 faces and ~5×10^7 cells.
 
   Large conn arrays (>~1 GiB): when sum(npe)*4 exceeds a single payload
   limit (~1073741824 bytes), scFLOW splits conn into multiple segments:
@@ -208,6 +209,10 @@ def format_description() -> str:
   Examples:
     laptop_simplified_voxel_v4.gph  - 2 conn chunks (~1.44 GiB total)
     laptop_simplified_denser_v2_gph.gph - 3 conn chunks (~2.05 GiB total)
+    laptop_simplified_voxel_v6.gph - 2 conn chunks (~1.91 GiB total)
+
+  gph2cgns imports _read_conn_continuations from gph_model (returns
+  got, pos, n_continuations — callers must unpack all three).
 
   Files >512 MiB: gph2cgns, gph_parser and gphviewer memory-map the file
   instead of loading it entirely into RAM.

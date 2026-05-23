@@ -19,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 
-from gph_model import _read_conn_continuations
+from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
 
 try:
     import h5py
@@ -361,7 +361,7 @@ def _parse_ls_links(data: bytes):
 
     if got < conn_total_expected:
         pos = conn_p + conn_bc + 4
-        got, _ = _read_conn_continuations(
+        got, _, _ = _read_conn_continuations(
             data, pos, sec_end, got, conn_total_expected, conn_parts,
         )
         if got < conn_total_expected:

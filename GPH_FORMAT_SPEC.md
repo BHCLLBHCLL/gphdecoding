@@ -152,7 +152,18 @@ CSR 索引：`face_offsets[0]=0`，`face_offsets[i+1]=face_offsets[i]+npe[i]`；
 | conn 第 2 段 | 268,435,456 条目（1 GiB，裸续接） |
 | conn 第 3 段 | 12,129,182 条目（~48 MiB，末段） |
 
-`gph2cgns.py` / `gph_model.py` 在主块之后循环读取裸 `byte_count` 续接块（亦支持标准 `[12,bc]` 块）并拼接后再做 CSR 索引。`gph_parser.py` / `gphviewer.py` 通过 `parse_ls_links_summary` 报告 `conn_got`、`conn_chunks`、`conn_complete`。**旧版解析器在 conn 块选错或续接不完整时直接失败**（报 `LS_Links parse failed`）。
+实测 `laptop_simplified_voxel_v6.gph`（~4.9 GiB，**2 段** conn）：
+
+| 项目 | 数值 |
+|------|------|
+| 面数 | 126,318,473 |
+| 单元数 | 38,895,916 |
+| 顶点数 | 48,526,564 |
+| `sum(npe)` | 513,041,554 |
+| conn 第 1 段 | 268,435,456 条目（1 GiB，标准块） |
+| conn 第 2 段 | 244,606,098 条目（~954 MiB，裸续接） |
+
+`gph2cgns.py` 从 `gph_model._read_conn_continuations` 导入续接逻辑（返回 `(got, pos, n_continuations)` 三元组）。`gph2cgns.py` / `gph_model.py` 在主块之后循环读取裸 `byte_count` 续接块（亦支持标准 `[12,bc]` 块）并拼接后再做 CSR 索引。`gph_parser.py` / `gphviewer.py` 通过 `parse_ls_links_summary` 报告 `conn_got`、`conn_chunks`、`conn_complete`。**旧版解析器在 conn 块选错或续接不完整时直接失败**（报 `LS_Links parse failed`）。
 
 纯三角 legacy 文件可能使用列主序 conn；`gph2cgns` 根据块大小与 `sum(npe)` 自动判别。
 
@@ -238,6 +249,8 @@ UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_path
 `laptop_simplified_voxel_v4.gph` 转换参考：解析 ~5 分钟，完整 CGNS 写出 ~16 分钟（输出约 14 GiB）。
 
 `laptop_simplified_denser_v2_gph.gph`（~5.9 GiB，conn 三段 ~2.05 GiB）：解析 ~9 分钟。
+
+`laptop_simplified_voxel_v6.gph`（~4.9 GiB，conn 两段 ~1.91 GiB）：解析 ~8 分钟。
 
 ## 7. 使用 Python 解析
 

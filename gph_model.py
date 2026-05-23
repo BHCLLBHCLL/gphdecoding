@@ -59,8 +59,9 @@ def open_gph_buffer(filepath: str):
     """Yield a bytes-like buffer for a GPH file.
 
     Files larger than 512 MiB are memory-mapped (as in ``gph2cgns.py``) so
-    multi-gigabyte meshes such as ``laptop_simplified_voxel_v4.gph`` can be
-    inspected without a full-RAM copy.
+    multi-gigabyte meshes such as ``laptop_simplified_voxel_v4.gph``,
+    ``laptop_simplified_denser_v2_gph.gph``, or ``laptop_simplified_voxel_v6.gph``
+    can be inspected without a full-RAM copy.
     """
     size = Path(filepath).stat().st_size
     if size <= _LARGE_GPH_BYTES:
