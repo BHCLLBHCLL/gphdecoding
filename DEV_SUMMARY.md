@@ -787,6 +787,33 @@ conn     : 513041554 entries in 2 chunks
 
 解析 ~8 min。
 
+### 11.9 LS_Parts cvol_id 扫描首值 sanity check（#14）
+
+**问题**：某些再保存 / 非典型 GPH 文件中，`_parse_ls_parts_with_cvol_ids` 的字节扫描会 latch 到 Part 名块之后第一个无关的 `[12, 4, X, 4]` 描述符（而非真正的 cvol_id 描述符），导致首个 Part 的 cvol_id 被识别为 `>1`（例如 `2`），下游 Zone cell 掩码错位。
+
+**经验事实**：合法文件中**首个 Part 的 cvol_id 恒为 `1`**：
+
+| 文件 | 扫描得到的 cvol_id |
+|------|----------------------|
+| `box_ansa.gph` | `[1]` |
+| `tr03.gph` | `[1, 2]` |
+| `laptop_simplified_voxel_less.gph` | `[1, 9, 11]` |
+
+**修复**：扫描完所有 Part 后，若首个非空 cvol_id `>1` 则整套扫描结果不可信，回退为顺序 1-based 编号（`1, 2, 3, …`）；首值为 `1` 时信任扫描，保留 `{1, 9, 11}` 等合法的非连续 id（与 §10.3 不冲突）。
+
+**配套同步**：
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph2cgns.py` | `_parse_ls_parts_with_cvol_ids()` 增加 sanity check 与 sequential fallback（#14） |
+| `gph_model.py` | `parse_ls_parts()` 同步同样的 sanity check（保持解析器/查看器/转换器三方一致） |
+| `gph_parser.py` | `format_description()` §10 LS_Parts 说明新增 sanity-check 行为 |
+| `gphviewer.py` | 通过 `gph_model.parse_ls_parts` 自动获得新行为（无需源码改动） |
+| `GPH_FORMAT_SPEC.md` | §5.6 增加 cvol_id 扫描 sanity check 段落 |
+| `DEV_SUMMARY.md` | 本节 |
+
+**相关提交**：`9fbd085  fix(gph2cgns): fall back to sequential cvol_ids when first part scans >1 (#14)`
+
 ---
 
 ## 12. 后续方向：Zone/BC 命名去硬编码

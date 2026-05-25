@@ -229,6 +229,13 @@ def format_description() -> str:
   The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
   before the next part's name block.
 
+  Sanity check: empirically the first part's cvol_id is always 1 on well-
+  formed files (box_ansa [1], tr03 [1,2], laptop [1,9,11]).  If the byte
+  scan returns a first value > 1 (the descriptor scan latched onto an
+  unrelated [12,4,X,4]) the parser falls back to sequential 1-based
+  indexing (1, 2, 3, ...).  When the first scanned value is 1 the scan
+  is trusted (legitimate non-contiguous ids like {1, 9, 11} are kept).
+
 11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
 --------------------------------------------------------
   LS_VolumeRegions: ASCII names -> one CGNS Zone_t each (FluidRegion, etc.).
