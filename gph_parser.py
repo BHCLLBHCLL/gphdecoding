@@ -231,21 +231,15 @@ def format_description() -> str:
   The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
   before the next part's name block.
 
-  Sanity checks (two complementary heuristics):
-    1. First-value rule: empirically the first part's cvol_id is always 1
-       on well-formed files (box_ansa [1], tr03 [1,2], laptop [1,9,11]).
-       A first value > 1 means the descriptor scan latched onto an
-       unrelated [12,4,X,4] and is unreliable → fall back to sequential
-       1-based indexing (1, 2, 3, ...).
-    2. Cross-check against LS_CvolIdOfElements: each scanned cvol_id must
-       belong to the actual unique-cvol_id set that the cells reference.
-       If the majority of scanned values are absent from that set the scan
-       is also unreliable (larger / re-saved models can satisfy rule 1 by
-       coincidence yet still produce garbage values for later parts) →
-       fall back to sequential indexing.
-  When the first scanned value is 1 and most scanned ids belong to the
-  actual set, the scanned values are trusted (legitimate non-contiguous
-  ids like {1, 9, 11} are preserved).
+  Per-element validation against LS_CvolIdOfElements:
+    For each part the scanned cvol_id is verified individually against the
+    set of unique cvol_ids that the cells actually reference.  Only entries
+    whose scanned id is NOT in that set fall back to the part's 1-based
+    position in LS_Parts; every confidently-scanned id is preserved (so
+    legitimate non-contiguous sequences such as {1, 9, 11} survive intact).
+    This neutralises entries where the byte scan latched onto an unrelated
+    [12,4,X,4] descriptor.  When LS_CvolIdOfElements is unavailable the
+    scanned value is trusted as long as the scan produced one.
 
 11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
 --------------------------------------------------------

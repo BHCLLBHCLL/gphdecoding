@@ -856,6 +856,58 @@ if use_sequential and not all(1..N in actual_set):
 
 ---
 
+### 11.11 LS_Parts cvol_id 扫描逐元素校验（#17）
+
+**问题**：§11.9（首值规则）与 §11.10（多数命中规则）都是**聚合**判定——只要触发一次 fallback，就把**整套**扫描结果丢弃。在仅有少数条目（甚至单个条目）latch 到无关 `[12,4,X,4]` 描述符的中等损坏文件上，这会同时丢掉其他扫描正确的非连续 id（例如 `{1, 9, 11}`），把它们错误地替换为顺序 `{1, 2, 3}`。
+
+**修复**：把聚合启发式替换为**逐元素**交叉校验：
+
+- 在解析 `LS_Parts` 之前先解析 `LS_CvolIdOfElements`，得到单元实际引用的 cvol_id 唯一值集合 $S$（与 §11.10 相同）。
+- 扫描完所有 Part 后，对**每个 Part 单独**判定：
+  - 若扫描值非 `None` 且 $\in S$ → 信任并保留；
+  - 否则该条目回退为它在 `LS_Parts` 中的 1-based 顺序索引（`i+1`）。
+- 不再使用"首值必为 1"或"多数命中"等全局开关；首值是否为 `1`、命中比例如何都不影响其他条目。
+- 当 `LS_CvolIdOfElements` 不可用（`cvol_id is None`）时无法交叉校验，扫描值只要非 `None` 即信任，否则回退顺序索引。
+
+**判定流程**（伪代码）：
+
+```text
+scanned = byte_scan_LS_Parts(data)
+actual_set = set(unique(LS_CvolIdOfElements)) if cvol_id else None
+
+out = []
+for i, (name, cid) in enumerate(scanned, start=1):
+    if cid is not None and (actual_set is None or cid in actual_set):
+        out.append((name, cid))
+    else:
+        out.append((name, i))
+```
+
+**配套同步**：
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph2cgns.py` | `_parse_ls_parts_with_cvol_ids()` step 3 改为逐元素校验，删除首值/多数聚合启发式与 `sequential_ok` 兜底 |
+| `gph_model.py` | `parse_ls_parts()` 同步同样的逐元素逻辑（保持转换器/查看器/解析器三方一致） |
+| `gph_parser.py` | `format_description()` §10 LS_Parts 段落改写为"逐元素校验" |
+| `GPH_FORMAT_SPEC.md` | §5.6 cvol_id 扫描 sanity check 段落改写为"逐元素校验"版本（#14 / #16 / #17） |
+| `DEV_SUMMARY.md` | 本节 |
+
+**与 §11.9 / §11.10 的关系**：
+
+| 输入扫描结果 | §11.9 / §11.10 行为 | §11.11 行为 |
+|--------------|----------------------|--------------|
+| 全部命中（`{1, 9, 11}` 均 ∈ $S$） | 信任全部扫描 | 信任全部扫描（无变化） |
+| 仅首值不命中（其他全部 ∈ $S$） | 首值 > 1 → 全部回退 `{1, 2, …}`，丢失合法 id | 仅首值回退为 `1`，其余 `9, 11` 保留 |
+| 多数不命中（`{1, X, X}`, `X ∉ S`） | 多数不在集合 → 全部回退 `{1, 2, 3}` | 仅命中的 `1` 保留，其余回退 `{2, 3}` |
+| 全部不命中 | 全部回退 | 全部回退（等价） |
+
+**优势**：保留每个扫描正确的非连续 id；只**精准中和**确实异常的条目。
+
+**向后兼容**：`cvol_id=None` 时退化为"扫描非空即信任，否则顺序索引"；不再与 §11.9 完全等价（旧版还会用首值启发式），但在 `cvol_id` 不可用的样本上行为差异仅出现在扫描首值 > 1 的损坏文件——这类文件在本项目的参考数据集中不存在。
+
+---
+
 ## 12. 后续方向：Zone/BC 命名去硬编码
 
 > **状态**：待实施（2026-05-23 代码审查结论）。  
