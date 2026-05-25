@@ -390,7 +390,14 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
 
 
 def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
-    """Parse LS_Parts → [(part_name, cvol_id), ...] (see gph2cgns)."""
+    """Parse LS_Parts → [(part_name, cvol_id), ...] (see gph2cgns).
+
+    On well-formed files the first part's cvol_id is always 1 (box_ansa: [1],
+    tr03: [1, 2], laptop: [1, 9, 11]).  On some re-saved/malformed files the
+    byte scan can latch onto an unrelated [12,4,X,4] descriptor and return a
+    first value > 1; in that case fall back to sequential 1-based indexing
+    (mirrors ``gph2cgns._parse_ls_parts_with_cvol_ids``).
+    """
     sec_start = find_section(data, "LS_Parts")
     if sec_start < 0:
         return []
@@ -406,7 +413,7 @@ def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
         if not name or not any(c.isalpha() for c in name):
             continue
         name_blocks.append((name, p - 8, p + bc + 4))
-    out: list[tuple[str, int]] = []
+    scanned: list[tuple[str, Optional[int]]] = []
     for i, (name, _, after_trailer) in enumerate(name_blocks):
         scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
         cvol_id: Optional[int] = None
@@ -417,8 +424,17 @@ def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
                     and read_i32_be(data, pos + 12) == 4):
                 cvol_id = read_i32_be(data, pos + 8)
             pos += 4
-        if cvol_id is not None:
-            out.append((name, int(cvol_id)))
+        scanned.append((name, cvol_id))
+
+    first_valid = next((cid for _, cid in scanned if cid is not None), None)
+    use_sequential = first_valid is None or first_valid > 1
+
+    out: list[tuple[str, int]] = []
+    for idx, (name, cid) in enumerate(scanned, start=1):
+        if use_sequential:
+            out.append((name, idx))
+        elif cid is not None:
+            out.append((name, int(cid)))
     return out
 
 
