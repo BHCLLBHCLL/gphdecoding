@@ -459,7 +459,10 @@ def _parse_ls_string_section(data: bytes, section_name: str) -> list[str]:
     return out
 
 
-def _parse_ls_parts_with_cvol_ids(data: bytes) -> list[tuple[str, int]]:
+def _parse_ls_parts_with_cvol_ids(
+    data: bytes,
+    cvol_id: Optional[np.ndarray] = None,
+) -> list[tuple[str, int]]:
     """Parse ``LS_Parts`` returning ``[(part_name, cvol_id)]`` in file order.
 
     The cvol_id of each part is NOT its 1-based position in ``LS_Parts``.
@@ -487,6 +490,14 @@ def _parse_ls_parts_with_cvol_ids(data: bytes) -> list[tuple[str, int]]:
     The cvol_id descriptor of each part is therefore the LAST
     ``[12, 4, X, 4]`` descriptor before either the *next* part's name
     block or the end of the section.
+
+    ``cvol_id`` (optional) is the per-cell array parsed from
+    ``LS_CvolIdOfElements``; when provided it is used to validate the
+    scanned ids against the *actual* set of cvol_ids the mesh uses.
+    On larger / re-saved files the byte scan can latch onto unrelated
+    ``[12,4,X,4]`` descriptors and produce ids that don't belong to that
+    set — in that case the parser falls back to sequential indexing
+    (see step 3 below).
     """
     sec_start = _find_section(data, "LS_Parts")
     if sec_start < 0:
@@ -518,33 +529,71 @@ def _parse_ls_parts_with_cvol_ids(data: bytes) -> list[tuple[str, int]]:
     scanned: list[tuple[str, Optional[int]]] = []
     for i, (name, _, after_trailer) in enumerate(name_blocks):
         scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
-        cvol_id: Optional[int] = None
+        scanned_cvol: Optional[int] = None
         p = after_trailer
         while p + 16 <= scan_end:
             if (read_i32_be(data, p) == 12
                     and read_i32_be(data, p + 4) == 4
                     and read_i32_be(data, p + 12) == 4):
-                cvol_id = read_i32_be(data, p + 8)
+                scanned_cvol = read_i32_be(data, p + 8)
             p += 4
-        scanned.append((name, cvol_id))
+        scanned.append((name, scanned_cvol))
 
-    # 3) Sanity check.  Empirically the FIRST part's cvol_id is always 1
-    #    on well-formed files (``box_ansa``: [1], ``tr03``: [1, 2],
-    #    ``laptop``: [1, 9, 11]).  On some malformed / re-saved files
-    #    the byte scan latches onto an unrelated descriptor and returns
-    #    a first-part value > 1 (e.g. 2) — in that case the entire
-    #    scan is untrustworthy and we fall back to sequential 1-based
-    #    indexing (1, 2, 3, ...).  If the first value is 1 we trust the
-    #    scan (legitimate non-contiguous ids like 1, 9, 11 are kept).
+    # 3) Sanity checks.  Two complementary heuristics decide whether the
+    #    scanned ids are trustworthy or we should fall back to sequential
+    #    1-based indexing (1, 2, 3, ...):
+    #
+    #    (a) Empirically the FIRST part's cvol_id is always 1 on
+    #        well-formed files (``box_ansa``: [1], ``tr03``: [1, 2],
+    #        ``laptop``: [1, 9, 11]).  A first value > 1 signals that the
+    #        descriptor scan latched onto unrelated descriptors.
+    #    (b) When the per-cell ``LS_CvolIdOfElements`` array is available
+    #        the actual set of cvol_ids the mesh uses is known exactly.
+    #        Each scanned id MUST be one of those values; if the majority
+    #        are missing the scan is unreliable.  This catches larger /
+    #        re-saved models on which (a) alone is not enough — e.g. the
+    #        scan may by coincidence yield 1 for the first part but
+    #        garbage for the rest.
+    #
+    #    When falling back to sequential indexing we still confirm that
+    #    1, 2, ..., N is a plausible labeling (each generated id must be
+    #    in the actual cvol_id set when one is available); otherwise we
+    #    keep whatever scanned values are valid (still better than emitting
+    #    ids that point at no cells at all).
     first_valid = next((cid for _, cid in scanned if cid is not None), None)
     use_sequential = first_valid is None or first_valid > 1
 
+    actual_set: Optional[set] = None
+    if cvol_id is not None and len(cvol_id) > 0:
+        actual_set = {int(x) for x in np.unique(cvol_id)}
+
+    if not use_sequential and actual_set:
+        scanned_vals = [int(cid) for _, cid in scanned if cid is not None]
+        if scanned_vals:
+            in_set = sum(1 for cv in scanned_vals if cv in actual_set)
+            # "Majority not in actual set" → scan is unreliable.
+            if in_set * 2 < len(scanned_vals):
+                use_sequential = True
+
+    # If sequential indexing would itself be inconsistent with the actual
+    # cvol_id set, prefer the per-part scanned id when it IS in the set
+    # (some files have a partly-corrupt scan where, say, only the first
+    # entry is wrong).
+    sequential_ok = True
+    if use_sequential and actual_set is not None:
+        sequential_ok = all(idx in actual_set
+                            for idx in range(1, len(scanned) + 1))
+
     out: list[tuple[str, int]] = []
     for idx, (name, cid) in enumerate(scanned, start=1):
-        if use_sequential:
+        if use_sequential and sequential_ok:
             out.append((name, idx))
-        elif cid is not None:
+        elif cid is not None and (actual_set is None or int(cid) in actual_set):
             out.append((name, int(cid)))
+        elif use_sequential:
+            # Sequential fallback even when not all 1..N are in the actual
+            # set — best effort for files we can't otherwise interpret.
+            out.append((name, idx))
     return out
 
 
@@ -838,7 +887,9 @@ def parse_gph_mesh(filepath: str) -> dict:
         # Partition metadata is always parsed if present, even if mesh is broken.
         result["cvol_id"] = _parse_ls_cvol_ids(data)
         result["volume_regions"] = _parse_ls_string_section(data, "LS_VolumeRegions")
-        result["parts_with_cvol"] = _parse_ls_parts_with_cvol_ids(data)
+        result["parts_with_cvol"] = _parse_ls_parts_with_cvol_ids(
+            data, cvol_id=result["cvol_id"],
+        )
         # Backward-compat: legacy ``parts`` list of just the part names.
         result["parts"] = [name for name, _ in result["parts_with_cvol"]]
         result["assembly_info"] = _parse_ls_assemblies(data)
