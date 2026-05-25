@@ -93,7 +93,10 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
     if links:
         result["mesh_summary"] = links
 
-    parts = parse_ls_parts(data)
+    # Parse cvol_id first so the LS_Parts scan can cross-check against it.
+    cvol = parse_ls_cvol_ids(data)
+
+    parts = parse_ls_parts(data, cvol_id=cvol)
     if parts:
         result["partition"]["LS_Parts"] = parts
 
@@ -109,7 +112,6 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
     if asm.get("part_paths") or asm.get("root_empty_prefix"):
         result["partition"]["LS_Assemblies"] = asm
 
-    cvol = parse_ls_cvol_ids(data)
     if cvol is not None:
         n_cv = len(cvol)
         sample = cvol[:10].tolist()
@@ -229,12 +231,21 @@ def format_description() -> str:
   The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
   before the next part's name block.
 
-  Sanity check: empirically the first part's cvol_id is always 1 on well-
-  formed files (box_ansa [1], tr03 [1,2], laptop [1,9,11]).  If the byte
-  scan returns a first value > 1 (the descriptor scan latched onto an
-  unrelated [12,4,X,4]) the parser falls back to sequential 1-based
-  indexing (1, 2, 3, ...).  When the first scanned value is 1 the scan
-  is trusted (legitimate non-contiguous ids like {1, 9, 11} are kept).
+  Sanity checks (two complementary heuristics):
+    1. First-value rule: empirically the first part's cvol_id is always 1
+       on well-formed files (box_ansa [1], tr03 [1,2], laptop [1,9,11]).
+       A first value > 1 means the descriptor scan latched onto an
+       unrelated [12,4,X,4] and is unreliable → fall back to sequential
+       1-based indexing (1, 2, 3, ...).
+    2. Cross-check against LS_CvolIdOfElements: each scanned cvol_id must
+       belong to the actual unique-cvol_id set that the cells reference.
+       If the majority of scanned values are absent from that set the scan
+       is also unreliable (larger / re-saved models can satisfy rule 1 by
+       coincidence yet still produce garbage values for later parts) →
+       fall back to sequential indexing.
+  When the first scanned value is 1 and most scanned ids belong to the
+  actual set, the scanned values are trusted (legitimate non-contiguous
+  ids like {1, 9, 11} are preserved).
 
 11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
 --------------------------------------------------------

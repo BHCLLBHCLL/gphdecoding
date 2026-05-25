@@ -389,7 +389,10 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
     }
 
 
-def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
+def parse_ls_parts(
+    data: bytes,
+    cvol_id: Optional["np.ndarray"] = None,
+) -> list[tuple[str, int]]:
     """Parse LS_Parts → [(part_name, cvol_id), ...] (see gph2cgns).
 
     On well-formed files the first part's cvol_id is always 1 (box_ansa: [1],
@@ -397,6 +400,14 @@ def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
     byte scan can latch onto an unrelated [12,4,X,4] descriptor and return a
     first value > 1; in that case fall back to sequential 1-based indexing
     (mirrors ``gph2cgns._parse_ls_parts_with_cvol_ids``).
+
+    ``cvol_id`` (optional) is the per-cell array parsed from
+    ``LS_CvolIdOfElements``.  When provided the parser also cross-checks each
+    scanned value against the actual set of cvol_ids used by the mesh — on
+    larger / re-saved files the first-value heuristic alone is not enough
+    (the scan can yield 1 for the first part by coincidence yet garbage for
+    the rest).  If the majority of scanned values are not present in that
+    set the parser falls back to sequential indexing.
     """
     sec_start = find_section(data, "LS_Parts")
     if sec_start < 0:
@@ -416,25 +427,43 @@ def parse_ls_parts(data: bytes) -> list[tuple[str, int]]:
     scanned: list[tuple[str, Optional[int]]] = []
     for i, (name, _, after_trailer) in enumerate(name_blocks):
         scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
-        cvol_id: Optional[int] = None
+        scanned_cvol: Optional[int] = None
         pos = after_trailer
         while pos + 16 <= scan_end:
             if (read_i32_be(data, pos) == 12
                     and read_i32_be(data, pos + 4) == 4
                     and read_i32_be(data, pos + 12) == 4):
-                cvol_id = read_i32_be(data, pos + 8)
+                scanned_cvol = read_i32_be(data, pos + 8)
             pos += 4
-        scanned.append((name, cvol_id))
+        scanned.append((name, scanned_cvol))
 
     first_valid = next((cid for _, cid in scanned if cid is not None), None)
     use_sequential = first_valid is None or first_valid > 1
 
+    actual_set: Optional[set] = None
+    if cvol_id is not None and len(cvol_id) > 0:
+        actual_set = {int(x) for x in np.unique(cvol_id)}
+
+    if not use_sequential and actual_set:
+        scanned_vals = [int(cid) for _, cid in scanned if cid is not None]
+        if scanned_vals:
+            in_set = sum(1 for cv in scanned_vals if cv in actual_set)
+            if in_set * 2 < len(scanned_vals):
+                use_sequential = True
+
+    sequential_ok = True
+    if use_sequential and actual_set is not None:
+        sequential_ok = all(idx in actual_set
+                            for idx in range(1, len(scanned) + 1))
+
     out: list[tuple[str, int]] = []
     for idx, (name, cid) in enumerate(scanned, start=1):
-        if use_sequential:
+        if use_sequential and sequential_ok:
             out.append((name, idx))
-        elif cid is not None:
+        elif cid is not None and (actual_set is None or int(cid) in actual_set):
             out.append((name, int(cid)))
+        elif use_sequential:
+            out.append((name, idx))
     return out
 
 
@@ -700,7 +729,8 @@ class GphDocument:
                            value=arr, raw=raw, children=[])
 
         if name == "LS_Parts":
-            parts = parse_ls_parts(file_data)
+            cvol_arr_for_parts = parse_ls_cvol_ids(file_data)
+            parts = parse_ls_parts(file_data, cvol_id=cvol_arr_for_parts)
             val = [f"{p} (cvol_id={cv})" for p, cv in parts]
             return GphNode(name, offset, len(raw),
                            f"parts[{len(parts)}]", value=val, raw=raw, children=[])

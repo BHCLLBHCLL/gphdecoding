@@ -816,6 +816,46 @@ conn     : 513041554 entries in 2 chunks
 
 ---
 
+### 11.10 LS_Parts cvol_id 扫描值与 LS_CvolIdOfElements 交叉校验（#16）
+
+**问题**：§11.9 中"首值 > 1 才回退顺序索引"的规则在更大模型（>1e7 cells、多 Part、re-saved 文件）上仍不够稳健——字节扫描可能恰好把首 Part 扫成 `1`（误把 Part 描述符链上的某个无关 `[12, 4, 1, 4]` marker 当作 cvol_id），但后续 Part 的扫描值仍为垃圾值，下游 `_classify_zone_cells` 在 `cvol_id == name_to_cvol[part]` 上得到全 0 掩码，对应 Zone 被丢空。
+
+**修复**：在 §11.9 的首值规则之外新增一条交叉校验：
+
+- 在解析 `LS_Parts` 之前先解析 `LS_CvolIdOfElements`，得到单元实际引用的 cvol_id 唯一值集合 $S = \{c_1, c_2, \dots\}$。
+- 扫描完所有 Part 后，统计扫描值落入 $S$ 的比例；若**多数（≥50%）扫描值不在 $S$ 中**，整套扫描视为不可信，回退为顺序 1-based 编号。
+- 若回退后 `{1, 2, …, N}` 自身也不全部属于 $S$（极端损坏文件），则尽量保留落在 $S$ 中的扫描值——避免输出指向空集合的 cvol_id。
+
+**API 变化**：
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph2cgns.py` | `_parse_ls_parts_with_cvol_ids(data, cvol_id=None)` 新增 `cvol_id` 形参；`parse_gph_mesh` 调用时透传 `LS_CvolIdOfElements` 结果 |
+| `gph_model.py` | `parse_ls_parts(data, cvol_id=None)` 同步新增 `cvol_id` 形参；`_create_node` 中 LS_Parts 分支在调用前显式解析 cvol_id 数组 |
+| `gph_parser.py` | 调整解析顺序：先 `parse_ls_cvol_ids`，再把结果传入 `parse_ls_parts`；`format_description()` §10 改写为两条 sanity check 规则 |
+| `gphviewer.py` | 通过 `gph_model.parse_ls_parts` 自动获得新行为（无需源码改动） |
+| `GPH_FORMAT_SPEC.md` | §5.6 cvol_id 扫描 sanity check 段落改写为双规则版本 |
+
+**判定流程**（伪代码）：
+
+```text
+scanned = byte_scan_LS_Parts(data)
+actual_set = set(unique(LS_CvolIdOfElements))
+
+use_sequential = (first_scanned is None) or (first_scanned > 1)
+if not use_sequential and actual_set:
+    if majority(scanned) not in actual_set:
+        use_sequential = True
+
+if use_sequential and not all(1..N in actual_set):
+    # 顺序索引也不可信 → 尽量保留 scanned 中属于 actual_set 的值
+    ...
+```
+
+向后兼容：`cvol_id` 形参为可选；不传时退化为 §11.9 的纯首值规则。
+
+---
+
 ## 12. 后续方向：Zone/BC 命名去硬编码
 
 > **状态**：待实施（2026-05-23 代码审查结论）。  
