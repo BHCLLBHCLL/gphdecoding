@@ -482,13 +482,14 @@ def parse_ls_string_list(data: bytes, section_name: str) -> list[str]:
     return out
 
 
-def parse_ls_surface_regions_summary(data: bytes) -> list[tuple[str, int]]:
+def parse_ls_surface_regions(data: bytes) -> list[tuple[str, "np.ndarray"]]:
+    """Parse LS_SurfaceRegions -> [(name, face_ids), ...]."""
     sec_start = find_section(data, "LS_SurfaceRegions")
     if sec_start < 0:
         return []
     sec_end = section_end(data, sec_start)
     blocks = list(iter_data_blocks(data, sec_start, sec_end))
-    out: list[tuple[str, int]] = []
+    out: list[tuple[str, "np.ndarray"]] = []
     i = 0
     while i + 2 < len(blocks):
         p_n, bc_n = blocks[i]
@@ -503,11 +504,18 @@ def parse_ls_surface_regions_summary(data: bytes) -> list[tuple[str, int]]:
             i += 1
             continue
         if bc_i > 0 and bc_i == bc_w and bc_i % 4 == 0:
-            out.append((name, bc_i // 4))
+            face_ids = np.frombuffer(
+                data, dtype=">i4", count=bc_i // 4, offset=p_i,
+            ).astype(np.int64).copy()
+            out.append((name, face_ids))
             i += 3
         else:
             i += 1
     return out
+
+
+def parse_ls_surface_regions_summary(data: bytes) -> list[tuple[str, int]]:
+    return [(name, int(face_ids.size)) for name, face_ids in parse_ls_surface_regions(data)]
 
 
 def parse_ls_assemblies_summary(data: bytes) -> dict:
@@ -564,6 +572,258 @@ def parse_ls_assemblies_summary(data: bytes) -> dict:
     }
 
 
+def classify_volume_region_cells(
+    zone_name: str,
+    parts_with_cvol: list[tuple[str, int]],
+    cvol_id: Optional["np.ndarray"],
+    n_cells: int,
+) -> "np.ndarray":
+    """Return a cell mask for a volume/part region name."""
+    all_mask = np.ones(n_cells, dtype=bool)
+    if zone_name == "FluidRegion":
+        return all_mask
+    if cvol_id is None or len(cvol_id) != n_cells or not parts_with_cvol:
+        return all_mask
+
+    name_to_cvol = {name: cv for name, cv in parts_with_cvol}
+    if zone_name.startswith("@VPartRegion_"):
+        rem = zone_name[len("@VPartRegion_") :].split("[", 1)[0]
+        if rem in name_to_cvol:
+            return cvol_id == name_to_cvol[rem]
+    if zone_name.startswith("FPHPARTS."):
+        candidate = zone_name[len("FPHPARTS.") :].rsplit(".", 1)[-1]
+        if candidate in name_to_cvol:
+            return cvol_id == name_to_cvol[candidate]
+    matches = sorted(
+        (p for p, _ in parts_with_cvol if p and p in zone_name),
+        key=len,
+        reverse=True,
+    )
+    if matches:
+        return cvol_id == name_to_cvol[matches[0]]
+    return all_mask
+
+
+def _score_coord_axes(axes: list["np.ndarray"]) -> float:
+    score = 0.0
+    for ax in axes:
+        finite = np.isfinite(ax)
+        if not finite.all():
+            score += 1e30
+            continue
+        absmax = float(np.max(np.abs(ax))) if ax.size else 0.0
+        if absmax > 1e6 or (absmax < 1e-30 and absmax != 0.0):
+            score += absmax + (1.0 / max(absmax, 1e-300))
+        else:
+            score += absmax
+    return score
+
+
+def _ls_nodes_coordinate_layout(data) -> Optional[dict]:
+    sec_start = find_section(data, "LS_Nodes")
+    if sec_start < 0:
+        return None
+    sec_end = section_end(data, sec_start)
+    f64_blocks = [
+        (p, bc) for p, bc in iter_data_blocks(data, sec_start, sec_end)
+        if bc >= 8 and bc % 8 == 0
+    ]
+    if len(f64_blocks) < 3:
+        return None
+    sizes = [bc for _, bc in f64_blocks]
+    target = max(set(sizes), key=sizes.count)
+    trio = [(p, bc) for p, bc in f64_blocks if bc == target][:3]
+    if len(trio) < 3:
+        return None
+    n_vertices = trio[0][1] // 8
+    n_sample = min(n_vertices, 256)
+    axes_be = [_f64_be_array(data, p, n_sample) for p, _ in trio]
+    axes_wr = [_f64_wr_array(data, p, n_sample) for p, _ in trio]
+    if _score_coord_axes(axes_be) <= _score_coord_axes(axes_wr):
+        return {
+            "blocks": trio,
+            "n_vertices": n_vertices,
+            "dialect": "standard BE float64",
+            "word_reversed": False,
+            "perm": (0, 1, 2),
+        }
+    return {
+        "blocks": trio,
+        "n_vertices": n_vertices,
+        "dialect": "word-reversed float64",
+        "word_reversed": True,
+        "perm": (0, 2, 1),
+    }
+
+
+def _read_vertices_by_id(data, vertex_ids: "np.ndarray") -> tuple["np.ndarray", dict]:
+    layout = _ls_nodes_coordinate_layout(data)
+    if layout is None or vertex_ids.size == 0:
+        return np.empty((0, 3), dtype=float), {}
+    n_vertices = int(layout["n_vertices"])
+    ids = np.asarray(vertex_ids, dtype=np.int64)
+    ids = np.clip(ids, 0, max(n_vertices - 1, 0))
+    coords_file = np.empty((ids.size, 3), dtype=float)
+    for axis_idx, (p, _) in enumerate(layout["blocks"]):
+        if layout["word_reversed"]:
+            vals = [read_f64_wr(data, p + int(i) * 8) for i in ids]
+        else:
+            vals = [read_f64_be(data, p + int(i) * 8) for i in ids]
+        coords_file[:, axis_idx] = vals
+    coords = coords_file[:, list(layout["perm"])]
+    return coords, layout
+
+
+def _parse_ls_links_layout(data) -> Optional[dict]:
+    sec_start = find_section(data, "LS_Links")
+    if sec_start < 0:
+        return None
+    sec_end = section_end(data, sec_start)
+    blocks = [(p, bc) for p, bc in iter_data_blocks(data, sec_start, sec_end) if bc > 0]
+    if not blocks:
+        return None
+
+    from collections import Counter
+    common = Counter([bc for _, bc in blocks]).most_common()
+    n_faces_block_size = None
+    for size, count in common:
+        if count >= 3 and size % 4 == 0 and size >= 4:
+            n_faces_block_size = size
+            break
+    if n_faces_block_size is None:
+        return None
+    n_faces = n_faces_block_size // 4
+    triples = [b for b in blocks if b[1] == n_faces_block_size][:3]
+    if len(triples) < 3:
+        return None
+    owner_p, _ = triples[0]
+    neigh_p, _ = triples[1]
+    npe_p, _ = triples[2]
+    owner = np.frombuffer(data, dtype=">u4", count=n_faces, offset=owner_p).astype(np.int64)
+    neigh_raw = np.frombuffer(data, dtype=">u4", count=n_faces, offset=neigh_p)
+    neighbor = neigh_raw.astype(np.int64)
+    neighbor[neigh_raw == 0xFFFFFFFF] = -1
+    npe = np.frombuffer(data, dtype=">u4", count=n_faces, offset=npe_p).astype(np.int64)
+    conn_total_expected = int(npe.sum())
+    conn_block = None
+    for p, bc in blocks:
+        if (p, bc) in triples or bc % 4 != 0:
+            continue
+        if bc // 4 == conn_total_expected:
+            conn_block = (p, bc)
+            break
+    if conn_block is None:
+        for p, bc in blocks:
+            if (p, bc) in triples or bc % 4 != 0 or bc < 12:
+                continue
+            if conn_block is None or bc > conn_block[1]:
+                conn_block = (p, bc)
+    if conn_block is None:
+        return None
+    conn_p, conn_bc = conn_block
+    n_cells = int(max(
+        int(owner.max()) + 1 if owner.size else 0,
+        int(neighbor[neighbor >= 0].max()) + 1 if (neighbor >= 0).any() else 0,
+    ))
+    return {
+        "n_faces": n_faces,
+        "n_cells": n_cells,
+        "owner": owner,
+        "neighbor": neighbor,
+        "npe": npe,
+        "conn_p": conn_p,
+        "conn_entries_expected": conn_total_expected,
+        "conn_entries_available": conn_bc // 4,
+    }
+
+
+def build_mesh_preview(
+    data,
+    selected_face_ids: Optional["np.ndarray"] = None,
+    selected_cell_ids: Optional["np.ndarray"] = None,
+    max_faces: int = 12000,
+) -> Optional[dict]:
+    """Build a small polygon preview for interactive 3D display."""
+    links = _parse_ls_links_layout(data)
+    if not links:
+        return None
+    n_faces = int(links["n_faces"])
+    owner = links["owner"]
+    neighbor = links["neighbor"]
+    npe = links["npe"]
+
+    face_sets: list["np.ndarray"] = []
+    if selected_face_ids is not None and selected_face_ids.size:
+        face_sets.append(np.asarray(selected_face_ids, dtype=np.int64))
+    if selected_cell_ids is not None and selected_cell_ids.size:
+        cells = np.asarray(selected_cell_ids, dtype=np.int64)
+        owner_in = np.isin(owner, cells)
+        neigh_in = np.isin(neighbor, cells)
+        face_sets.append(np.flatnonzero(owner_in | neigh_in))
+
+    selection_active = bool(face_sets)
+    if face_sets:
+        face_ids = np.unique(np.concatenate(face_sets))
+        face_ids = face_ids[(face_ids >= 0) & (face_ids < n_faces)]
+    else:
+        face_ids = np.arange(min(n_faces, max_faces), dtype=np.int64)
+
+    if face_ids.size > max_faces:
+        idx = np.linspace(0, face_ids.size - 1, max_faces, dtype=np.int64)
+        face_ids = face_ids[idx]
+
+    if face_ids.size == 0:
+        return {
+            "faces": [],
+            "face_ids": np.empty(0, dtype=np.int64),
+            "selection_active": selection_active,
+            "summary": "No faces matched the selected region.",
+        }
+
+    face_offsets = np.empty(n_faces + 1, dtype=np.int64)
+    face_offsets[0] = 0
+    np.cumsum(npe, out=face_offsets[1:])
+    conn_available = int(links["conn_entries_available"])
+    valid = face_offsets[face_ids + 1] <= conn_available
+    face_ids = face_ids[valid]
+    if face_ids.size == 0:
+        return {
+            "faces": [],
+            "face_ids": np.empty(0, dtype=np.int64),
+            "selection_active": selection_active,
+            "summary": "Selected faces are outside the available preview connectivity block.",
+        }
+
+    need_conn = int(face_offsets[face_ids[-1] + 1])
+    conn = np.frombuffer(
+        data, dtype=">u4", count=need_conn, offset=int(links["conn_p"]),
+    ).astype(np.int64)
+
+    face_node_ids: list["np.ndarray"] = []
+    for fid in face_ids:
+        lo = int(face_offsets[fid])
+        hi = int(face_offsets[fid + 1])
+        face_node_ids.append(conn[lo:hi])
+    unique_vertices = np.unique(np.concatenate(face_node_ids)) if face_node_ids else np.empty(0, dtype=np.int64)
+    coords, node_layout = _read_vertices_by_id(data, unique_vertices)
+    vertex_lookup = {int(vid): coords[i] for i, vid in enumerate(unique_vertices)}
+    polygons = [
+        np.array([vertex_lookup[int(v)] for v in nodes if int(v) in vertex_lookup], dtype=float)
+        for nodes in face_node_ids
+    ]
+    polygons = [poly for poly in polygons if poly.shape[0] >= 3]
+    return {
+        "faces": polygons,
+        "face_ids": face_ids,
+        "selection_active": selection_active,
+        "n_faces": n_faces,
+        "n_cells": int(links["n_cells"]),
+        "n_vertices": int(node_layout.get("n_vertices", 0)) if node_layout else 0,
+        "dialect": node_layout.get("dialect", "") if node_layout else "",
+        "summary": f"{face_ids.size} faces",
+    }
+
+
 @dataclass
 class GphNode:
     """A node in the GPH tree - can represent a section or a data item."""
@@ -577,6 +837,7 @@ class GphNode:
     children: list = field(default_factory=list)
     modified: bool = False
     parent: Optional["GphNode"] = None
+    metadata: dict = field(default_factory=dict)
 
     def get_raw(self, doc: Optional["GphDocument"] = None) -> bytes:
         """Return raw bytes - from doc if provided (for modified data), else cached."""
@@ -661,6 +922,7 @@ class GphDocument:
         for start, end, name, desc in sections:
             raw = data[start:end]
             node = self._create_node(name, start, raw, desc)
+            self._add_binary_children(node)
             node.parent = root
             root.children.append(node)
 
@@ -760,6 +1022,125 @@ class GphDocument:
         return GphNode(name, offset, len(raw), "raw", value=desc, raw=raw, children=[])
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _add_binary_children(self, node: GphNode) -> None:
+        """Attach record-level children so the GUI can expand binary layout."""
+        raw = node.raw
+        if node.name == "file_header":
+            self._add_file_header_children(node, raw)
+            return
+        if len(raw) >= 40:
+            label_len = read_i32_be(raw, 0)
+            self._append_child(
+                node, "section_name_length", 0, 4, "I4", label_len,
+            )
+            label = raw[4:36].decode("ascii", errors="replace").rstrip()
+            self._append_child(
+                node, "section_name", 4, 32, "C1[32]", label,
+            )
+            self._scan_section_records(node, raw, 40)
+
+    def _add_file_header_children(self, node: GphNode, raw: bytes) -> None:
+        if len(raw) >= 4:
+            n = read_i32_be(raw, 0)
+            self._append_child(node, "format_id_length", 0, 4, "I4", n)
+        if len(raw) >= 12:
+            self._append_child(
+                node, "format_id", 4, min(8, len(raw) - 4), "C1",
+                raw[4:12].decode("ascii", errors="replace"),
+            )
+        dims = [("dim0", 12), ("dim1", 16), ("dim2", 20)]
+        for name, rel in dims:
+            if len(raw) >= rel + 4:
+                self._append_child(node, name, rel, 4, "I4", read_i32_be(raw, rel))
+        if len(raw) > 24:
+            self._append_child(node, "header_payload", 24, len(raw) - 24, "raw")
+
+    def _scan_section_records(self, node: GphNode, raw: bytes, pos: int) -> None:
+        block_idx = 0
+        unknown_start: Optional[int] = None
+
+        def flush_unknown(until: int) -> None:
+            nonlocal unknown_start
+            if unknown_start is not None and until > unknown_start:
+                self._append_child(
+                    node, "unclassified", unknown_start, until - unknown_start, "raw",
+                )
+            unknown_start = None
+
+        while pos + 8 <= len(raw):
+            if read_i32_be(raw, pos) != 12:
+                if unknown_start is None:
+                    unknown_start = pos
+                pos += 4
+                continue
+            v = read_i32_be(raw, pos + 4)
+            if v in (1, 4, 8) and pos + 16 <= len(raw):
+                d0 = read_i32_be(raw, pos + 8)
+                d1 = read_i32_be(raw, pos + 12)
+                if 0 <= d0 < 1_000_000_000 and 0 <= d1 < 1_000_000_000:
+                    flush_unknown(pos)
+                    val = f"type={v}, dims=({d0}, {d1})"
+                    self._append_child(node, "descriptor", pos, 16, "descriptor", val)
+                    pos += 16
+                    continue
+            bc = v
+            if bc > 0 and pos + 8 + bc + 4 <= len(raw):
+                payload_end = pos + 8 + bc
+                if read_i32_be(raw, payload_end) == bc:
+                    flush_unknown(pos)
+                    block_idx += 1
+                    block = self._append_child(
+                        node,
+                        f"data_block[{block_idx}]",
+                        pos,
+                        8 + bc + 4,
+                        f"block[{bc} B]",
+                        f"payload={bc} bytes",
+                    )
+                    self._append_child(block, "block_marker", 0, 4, "I4", 12)
+                    self._append_child(block, "byte_count", 4, 4, "I4", bc)
+                    self._append_child(block, "payload", 8, bc, "payload")
+                    self._append_child(block, "byte_count_trailer", 8 + bc, 4, "I4", bc)
+                    pos = payload_end + 4
+                    continue
+            if unknown_start is None:
+                unknown_start = pos
+            pos += 4
+        flush_unknown(len(raw))
+
+    @staticmethod
+    def _preview_value(raw: bytes, data_type: str):
+        if data_type.startswith("C1"):
+            return raw.decode("ascii", errors="replace").strip("\x00").rstrip()
+        if data_type == "payload":
+            if raw and all(b == 0 or 32 <= b < 127 for b in raw[: min(len(raw), 128)]):
+                return raw[:128].decode("ascii", errors="replace").strip("\x00").rstrip()
+            return None
+        return None
+
+    def _append_child(
+        self,
+        parent: GphNode,
+        name: str,
+        rel_offset: int,
+        size: int,
+        data_type: str,
+        value: Any = None,
+    ) -> GphNode:
+        raw = parent.raw[rel_offset : rel_offset + size]
+        child = GphNode(
+            name,
+            parent.offset + rel_offset,
+            size,
+            data_type,
+            self._preview_value(raw, data_type) if value is None else value,
+            raw=raw,
+            children=[],
+            parent=parent,
+        )
+        parent.children.append(child)
+        return child
 
     @staticmethod
     def _read_i4_array_after_label(raw: bytes) -> Optional[list[int]]:
