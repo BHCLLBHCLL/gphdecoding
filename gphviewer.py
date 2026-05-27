@@ -24,10 +24,7 @@ try:
         QTextEdit,
         QTableWidget,
         QTableWidgetItem,
-        QMenuBar,
-        QMenu,
         QFileDialog,
-        QStatusBar,
         QLabel,
         QGroupBox,
         QLineEdit,
@@ -35,9 +32,10 @@ try:
         QMessageBox,
         QHeaderView,
         QTabWidget,
+        QAbstractItemView,
     )
-    from PyQt6.QtCore import Qt
-    from PyQt6.QtGui import QAction
+    from PyQt6.QtCore import Qt, QPointF
+    from PyQt6.QtGui import QAction, QColor, QPainter, QPen, QBrush, QPolygonF
     HAS_PYQT = "PyQt6"
 except ImportError:
     try:
@@ -53,31 +51,35 @@ except ImportError:
             QTextEdit,
             QTableWidget,
             QTableWidgetItem,
-            QMenuBar,
-            QMenu,
-            QFileDialog,
-            QStatusBar,
-            QLabel,
+                    QFileDialog,
+                QLabel,
             QGroupBox,
             QLineEdit,
             QPushButton,
             QMessageBox,
             QHeaderView,
             QTabWidget,
+            QAbstractItemView,
         )
-        from PyQt5.QtCore import Qt
+        from PyQt5.QtCore import Qt, QPointF
+        from PyQt5.QtGui import QColor, QPainter, QPen, QBrush, QPolygonF
         from PyQt5.QtWidgets import QAction
         HAS_PYQT = "PyQt5"
     except ImportError:
         HAS_PYQT = None
 
+import numpy as np
+
 from gph_model import (
     GphDocument,
     GphNode,
+    build_mesh_preview,
+    classify_volume_region_cells,
     parse_ls_cvol_ids,
     parse_ls_links_summary,
     parse_ls_nodes_vertices,
     parse_ls_parts,
+    parse_ls_surface_regions,
     parse_ls_string_list,
 )
 
@@ -90,11 +92,138 @@ def read_i32_be(data: bytes, pos: int) -> int:
     return int.from_bytes(data[pos : pos + 4], "big")
 
 
+class MeshPreviewWidget(QWidget):
+    """Simple Qt-painted 3D mesh preview with rotate / pan / zoom."""
+
+    def __init__(self):
+        super().__init__()
+        self.preview = None
+        self.title = "Open a GPH file to preview mesh regions"
+        self.rot_x = -25.0
+        self.rot_y = 35.0
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._last_pos = None
+        self.setMinimumHeight(320)
+
+    def set_preview(self, preview: dict | None, title: str) -> None:
+        self.preview = preview
+        self.title = title
+        self.update()
+
+    def _event_xy(self, event):
+        if hasattr(event, "position"):
+            p = event.position()
+            return p.x(), p.y()
+        p = event.pos()
+        return p.x(), p.y()
+
+    def mousePressEvent(self, event):
+        self._last_pos = self._event_xy(event)
+
+    def mouseMoveEvent(self, event):
+        if self._last_pos is None:
+            return
+        x, y = self._event_xy(event)
+        dx = x - self._last_pos[0]
+        dy = y - self._last_pos[1]
+        buttons = event.buttons()
+        if hasattr(Qt, "MouseButton"):
+            middle = Qt.MouseButton.MiddleButton
+            right = Qt.MouseButton.RightButton
+        else:
+            middle = Qt.MiddleButton
+            right = Qt.RightButton
+        if (buttons & middle) or (buttons & right):
+            self.pan_x += dx
+            self.pan_y += dy
+        else:
+            self.rot_y += dx * 0.5
+            self.rot_x += dy * 0.5
+        self._last_pos = (x, y)
+        self.update()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        self.zoom *= 1.15 if delta > 0 else 1 / 1.15
+        self.zoom = max(0.05, min(self.zoom, 100.0))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if hasattr(QPainter, "RenderHint"):
+            antialias = QPainter.RenderHint.Antialiasing
+        else:
+            antialias = QPainter.Antialiasing
+        painter.setRenderHint(antialias)
+        painter.fillRect(self.rect(), QColor(22, 24, 28))
+        painter.setPen(QPen(QColor(230, 230, 230)))
+        painter.drawText(12, 22, self.title)
+
+        if not self.preview or not self.preview.get("faces"):
+            summary = (
+                self.preview.get("summary", "No mesh preview available")
+                if self.preview else "No mesh preview available"
+            )
+            painter.setPen(QPen(QColor(180, 180, 180)))
+            painter.drawText(12, 48, summary)
+            painter.end()
+            return
+
+        faces = self.preview["faces"]
+        all_pts = np.vstack(faces)
+        center = all_pts.mean(axis=0)
+        span = np.ptp(all_pts, axis=0)
+        scale = max(float(span.max()), 1e-12)
+        rx = np.deg2rad(self.rot_x)
+        ry = np.deg2rad(self.rot_y)
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        rot_x = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+        rot_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        rot = rot_y @ rot_x
+        size = min(self.width(), self.height()) * 0.78 * self.zoom
+        origin = np.array([
+            self.width() * 0.5 + self.pan_x,
+            self.height() * 0.55 + self.pan_y,
+        ])
+
+        projected = []
+        for poly in faces:
+            pts = ((poly - center) / scale) @ rot.T
+            screen = np.column_stack([pts[:, 0], -pts[:, 1]]) * size + origin
+            projected.append((float(pts[:, 2].mean()), screen))
+        projected.sort(key=lambda item: item[0])
+
+        selected = self.preview.get("selection_active", False)
+        fill = QColor(255, 155, 70, 150) if selected else QColor(90, 150, 255, 95)
+        edge = QColor(255, 235, 190) if selected else QColor(175, 205, 255)
+        painter.setPen(QPen(edge, 1.1))
+        painter.setBrush(QBrush(fill))
+        for _, screen in projected:
+            polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in screen])
+            painter.drawPolygon(polygon)
+
+        painter.setBrush(QBrush())
+        painter.setPen(QPen(QColor(145, 145, 145)))
+        painter.drawText(
+            12,
+            self.height() - 16,
+            "Drag: rotate   Right/middle drag: pan   Wheel: zoom",
+        )
+        painter.end()
+
+
 class GphViewerMain(QMainWindow):
     def __init__(self):
         super().__init__()
         self.doc = GphDocument()
         self.current_node: GphNode | None = None
+        self._surface_regions = []
+        self._cvol_ids = None
+        self._parts = []
+        self._volume_regions = []
         self.init_ui()
 
     def init_ui(self):
@@ -138,7 +267,11 @@ class GphViewerMain(QMainWindow):
         tree_box = QGroupBox("Structure")
         tree_layout = QVBoxLayout(tree_box)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Name", "Type", "Size"])
+        self.tree.setHeaderLabels(["Name", "Type", "Address Range", "Size"])
+        if hasattr(QAbstractItemView, "SelectionMode"):
+            self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        else:
+            self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self.on_selection_changed)
         tree_layout.addWidget(self.tree)
         splitter.addWidget(tree_box)
@@ -163,6 +296,14 @@ class GphViewerMain(QMainWindow):
         self.hex_text.setReadOnly(True)
         self.hex_text.setFontFamily("Consolas")
         self.tabs.addTab(self.hex_text, "Hex Dump")
+
+        mesh_tab = QWidget()
+        mesh_layout = QVBoxLayout(mesh_tab)
+        self.mesh_info = QLabel("Select a surface or volume region in the tree")
+        self.mesh_view = MeshPreviewWidget()
+        mesh_layout.addWidget(self.mesh_info)
+        mesh_layout.addWidget(self.mesh_view, 1)
+        self.tabs.addTab(mesh_tab, "3D Regions")
 
         right_layout.addWidget(self.tabs)
 
@@ -199,7 +340,9 @@ class GphViewerMain(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load: {path}")
             return
         self._mmap_readonly = getattr(self.doc, "_mmap_mode", False)
+        self._load_region_index()
         self._build_tree()
+        self._update_mesh_preview([])
         self.setWindowTitle(f"GPH Viewer - {Path(path).name}")
         summary = self._summarize_buffer(self.doc._raw_data)
         size_mb = len(self.doc._raw_data) / (1024 * 1024)
@@ -207,6 +350,13 @@ class GphViewerMain(QMainWindow):
         self.statusBar().showMessage(
             f"Opened: {path} ({size_mb:.1f} MiB{mmap_note}) — {summary}"
         )
+
+    def _load_region_index(self):
+        data = self.doc._raw_data
+        self._surface_regions = parse_ls_surface_regions(data)
+        self._cvol_ids = parse_ls_cvol_ids(data)
+        self._parts = parse_ls_parts(data, cvol_id=self._cvol_ids)
+        self._volume_regions = parse_ls_string_list(data, "LS_VolumeRegions")
 
     def closeEvent(self, event):
         self.doc.close()
@@ -247,18 +397,88 @@ class GphViewerMain(QMainWindow):
         root = self.doc.root
         if not root:
             return
-        item = QTreeWidgetItem([root.name, root.data_type, str(root.size)])
+        item = QTreeWidgetItem([
+            root.name,
+            root.data_type,
+            self._range_text(root),
+            str(root.size),
+        ])
         item.setData(0, 100, root)
         self._add_children(item, root)
+        self._add_region_tree(item)
         self.tree.addTopLevelItem(item)
         self.tree.expandToDepth(1)
+        for col in range(self.tree.columnCount()):
+            self.tree.resizeColumnToContents(col)
 
     def _add_children(self, parent_item: QTreeWidgetItem, node: GphNode):
         for child in node.children:
-            item = QTreeWidgetItem([child.name, child.data_type, str(child.size)])
+            item = QTreeWidgetItem([
+                child.name,
+                child.data_type,
+                self._range_text(child),
+                str(child.size),
+            ])
             item.setData(0, 100, child)
             parent_item.addChild(item)
             self._add_children(item, child)
+
+    def _range_text(self, node: GphNode) -> str:
+        if node.size <= 0:
+            return "virtual"
+        return f"0x{node.offset:04X}-0x{node.offset + node.size - 1:04X}"
+
+    def _add_region_tree(self, root_item: QTreeWidgetItem):
+        regions_root = GphNode(
+            "3D Regions", 0, 0, "virtual", "Interactive mesh region selectors",
+            metadata={"view_kind": "folder"},
+        )
+        regions_item = QTreeWidgetItem([regions_root.name, regions_root.data_type, "virtual", ""])
+        regions_item.setData(0, 100, regions_root)
+        root_item.addChild(regions_item)
+
+        all_node = GphNode(
+            "All mesh", 0, 0, "mesh preview", "Show the full mesh preview",
+            metadata={"view_kind": "mesh"},
+        )
+        all_item = QTreeWidgetItem([all_node.name, all_node.data_type, "virtual", ""])
+        all_item.setData(0, 100, all_node)
+        regions_item.addChild(all_item)
+
+        surf_root = GphNode("Surface Regions", 0, 0, "folder", metadata={"view_kind": "folder"})
+        surf_item = QTreeWidgetItem([surf_root.name, surf_root.data_type, "virtual", str(len(self._surface_regions))])
+        surf_item.setData(0, 100, surf_root)
+        regions_item.addChild(surf_item)
+        for name, face_ids in self._surface_regions:
+            node = GphNode(
+                name, 0, 0, "surface region", f"{len(face_ids)} faces",
+                metadata={"view_kind": "surface", "face_ids": face_ids},
+            )
+            item = QTreeWidgetItem([node.name, node.data_type, "virtual", str(len(face_ids))])
+            item.setData(0, 100, node)
+            surf_item.addChild(item)
+
+        vol_root = GphNode("Volume Regions", 0, 0, "folder", metadata={"view_kind": "folder"})
+        vol_item = QTreeWidgetItem([vol_root.name, vol_root.data_type, "virtual", ""])
+        vol_item.setData(0, 100, vol_root)
+        regions_item.addChild(vol_item)
+        for name in self._volume_regions:
+            node = GphNode(
+                name, 0, 0, "volume region", "Volume-region cell selection",
+                metadata={"view_kind": "volume_region", "region_name": name},
+            )
+            item = QTreeWidgetItem([node.name, node.data_type, "virtual", ""])
+            item.setData(0, 100, node)
+            vol_item.addChild(item)
+        for name, cvol_id in self._parts:
+            count = int((self._cvol_ids == cvol_id).sum()) if self._cvol_ids is not None else 0
+            node = GphNode(
+                f"Part: {name}", 0, 0, "volume part", f"cvol_id={cvol_id}, cells={count}",
+                metadata={"view_kind": "volume_part", "cvol_id": cvol_id},
+            )
+            item = QTreeWidgetItem([node.name, node.data_type, "virtual", str(count)])
+            item.setData(0, 100, node)
+            vol_item.addChild(item)
 
     def on_selection_changed(self):
         items = self.tree.selectedItems()
@@ -270,6 +490,10 @@ class GphViewerMain(QMainWindow):
         if isinstance(node, GphNode):
             self.current_node = node
             self._show_node(node)
+            self._update_mesh_preview([
+                item.data(0, 100) for item in items
+                if isinstance(item.data(0, 100), GphNode)
+            ])
         else:
             self.current_node = None
 
@@ -285,6 +509,7 @@ class GphViewerMain(QMainWindow):
         lines = [
             f"Name: {node.name}",
             f"Offset: 0x{node.offset:04X}",
+            f"Address range: {self._range_text(node)}",
             f"Size: {node.size} bytes",
             f"Type: {node.data_type}",
             "",
@@ -414,6 +639,62 @@ class GphViewerMain(QMainWindow):
                     lines.append(f"  {pname}: cvol_id={cv}, cells={int((cvol == cv).sum())}")
 
         return lines
+
+    def _update_mesh_preview(self, nodes: list[GphNode]):
+        if not getattr(self.doc, "_raw_data", None):
+            return
+        selected_faces: list[np.ndarray] = []
+        selected_cells: list[np.ndarray] = []
+        labels: list[str] = []
+        show_all = False
+
+        for node in nodes:
+            meta = node.metadata or {}
+            kind = meta.get("view_kind")
+            if kind == "mesh":
+                show_all = True
+                labels.append("All mesh")
+            elif kind == "surface":
+                selected_faces.append(np.asarray(meta.get("face_ids", []), dtype=np.int64))
+                labels.append(node.name)
+            elif kind == "volume_part" and self._cvol_ids is not None:
+                cvol_id = meta.get("cvol_id")
+                selected_cells.append(np.flatnonzero(self._cvol_ids == cvol_id))
+                labels.append(node.name)
+            elif kind == "volume_region":
+                summary = parse_ls_links_summary(self.doc._raw_data)
+                if summary:
+                    mask = classify_volume_region_cells(
+                        meta.get("region_name", node.name),
+                        self._parts,
+                        self._cvol_ids,
+                        int(summary["n_cells"]),
+                    )
+                    selected_cells.append(np.flatnonzero(mask))
+                    labels.append(node.name)
+
+        face_ids = np.concatenate(selected_faces) if selected_faces and not show_all else None
+        cell_ids = np.concatenate(selected_cells) if selected_cells and not show_all else None
+        preview = build_mesh_preview(
+            self.doc._raw_data,
+            selected_face_ids=face_ids,
+            selected_cell_ids=cell_ids,
+        )
+        if preview is None:
+            self.mesh_info.setText("3D preview unavailable: LS_Nodes or LS_Links is incomplete")
+            self.mesh_view.set_preview(None, "3D preview unavailable")
+            return
+
+        selected_label = " + ".join(labels) if labels else "All mesh"
+        stats = [
+            selected_label,
+            preview.get("summary", ""),
+            f"mesh={preview.get('n_vertices', 0)} vertices / {preview.get('n_faces', 0)} faces / {preview.get('n_cells', 0)} cells",
+        ]
+        if preview.get("dialect"):
+            stats.append(preview["dialect"])
+        self.mesh_info.setText(" | ".join(part for part in stats if part))
+        self.mesh_view.set_preview(preview, selected_label)
 
     def on_table_cell_changed(self, item: QTableWidgetItem):
         # Vertex / topology / partition arrays are read-only in the viewer.
