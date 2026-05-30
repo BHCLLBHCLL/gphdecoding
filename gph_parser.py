@@ -93,7 +93,7 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
     if links:
         result["mesh_summary"] = links
 
-    # Parse cvol_id first so the LS_Parts scan can cross-check against it.
+    # Parse cvol_id first — LS_Parts mapping uses its unique set as the authority.
     cvol = parse_ls_cvol_ids(data)
 
     parts = parse_ls_parts(data, cvol_id=cvol)
@@ -130,7 +130,7 @@ def _section_blurb(name: str) -> str:
         "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
         "LS_SurfaceRegions": "named BC regions -> global face id lists",
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
-        "LS_Parts": "part names + cvol_id descriptors",
+        "LS_Parts": "part names + post-name cvol_id descriptor chains (see format_description §10)",
         "LS_Assemblies": "XML assembly tree for zone naming",
         "LS_SolverUnusedRegions": "solver-internal region names",
         "Element_InformationFlag": "per-element flags",
@@ -227,13 +227,14 @@ def format_description() -> str:
 
 10. LS_Parts - part definitions
 -------------------------------
-  Repeated records: 255-byte ASCII name block + trailing descriptors.
-  The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
-  in each Part's post-name descriptor chain (typically [1, cvol_id]).
+  Repeated records: 255-byte ASCII name block + post-name descriptor chain.
+  Empirically the chain is [1, cvol_id] — leading 1 is a marker; the
+  trailing value is the opaque scFLOW Part id.
 
-  Resolution uses LS_CvolIdOfElements as the authoritative cvol_id set:
-  for each Part the parser picks the last chain value that belongs to that
-  set, then validates the full part→cvol_id mapping for uniqueness and
+  Resolution (gph_model.parse_ls_parts, shared by gph2cgns/gphviewer):
+  parse LS_CvolIdOfElements first; its unique values are the authoritative
+  cvol_id set.  For each Part pick the last chain value belonging to that
+  set, then validate the full part→cvol_id mapping for uniqueness and
   coverage.  Sequential 1-based indexing is used only when the actual set
   is exactly {1, 2, …, N}.
 

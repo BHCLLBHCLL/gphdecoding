@@ -27,4 +27,5 @@ Installed via `pip install numpy h5py PyQt6`. The `requirements.txt` lists PyQt5
 
 - The viewer (`gphviewer.py`) auto-detects PyQt6 first, then falls back to PyQt5. On Python 3.12+ only PyQt6 works.
 - `ruff` is installed to `~/.local/bin/` which may not be on PATH; use full path or add it to PATH.
-- The sample data file `box.gph` is committed in the repo root for testing.
+- The sample data file `box_ansa.gph` is in the repo root for testing.
+- **LS_Parts cvol_id mapping** lives in `gph_model.parse_ls_parts(data, cvol_id=…)`; always pass the `LS_CvolIdOfElements` array when available. `gph2cgns` imports this function — do not reintroduce a duplicate copy.

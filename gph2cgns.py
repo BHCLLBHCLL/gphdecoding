@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
-from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids
+from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
 
 try:
     import h5py

@@ -24,8 +24,8 @@ This is a **flat Python CLI/GUI toolkit** for reverse-engineering and converting
 
 ### File roles
 
-- **`gph_model.py`** — Shared library: data types (`GphNode`, `GphDocument`), binary section scanners, heuristics for vertex-coordinate dialect detection, LS_Links/LS_Parts/LS_Assemblies parsers, mesh-preview builder. This is the single source of truth for GPH parsing logic.
-- **`gph2cgns.py`** — Converter: **duplicates** a subset of the parsing functions from `gph_model` (intentionally — it's a self-contained deployment target). Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility. Only imports `_read_conn_continuations` from `gph_model`.
+- **`gph_model.py`** — Shared library: data types (`GphNode`, `GphDocument`), binary section scanners, heuristics for vertex-coordinate dialect detection, LS_Links/LS_Parts/LS_Assemblies parsers, mesh-preview builder. **Single source of truth** for GPH parsing logic, including `parse_ls_parts()` / cvol_id resolution.
+- **`gph2cgns.py`** — Converter: retains its own low-level section scanners for self-contained deployment, but imports `_read_conn_continuations` and `parse_ls_parts` from `gph_model`. Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility.
 - **`gph_parser.py`** — CLI inspector: imports all parsing functions from `gph_model`, prints structured section layout and format description.
 - **`gphviewer.py`** — PyQt GUI browser/editor: imports parsing functions from `gph_model`, builds tree view + hex dump + data table + 3D mesh preview via `MeshPreviewWidget`.
 
@@ -51,13 +51,18 @@ The parser decodes both and picks the one whose coordinate magnitudes look physi
 
 When `sum(npe)*4` exceeds ~1 GiB, the connectivity array is split into multiple segments. The first segment uses the standard `[12, bc][payload][bc]` block format; continuation chunks use bare `[I4=byte_count][payload]` (no `[I4=12]` header). `_read_conn_continuations` in `gph_model` handles concatenation. The converter imports this directly.
 
-### cvol_id heuristics in LS_Parts
+### cvol_id resolution in LS_Parts
 
-The `cvol_id` for each part is NOT the 1-based index — it's an opaque identifier recorded in a `[12, 4, cvol_id, 4]` descriptor after each part's 255-byte name block. Two complementary sanity checks guard the byte-scan:
-1. **First-value rule**: on well-formed files the first part's cvol_id is always 1. A first value > 1 is unreliable → fall back to sequential 1..N indexing.
-2. **Cross-check against LS_CvolIdOfElements**: each scanned cvol_id must belong to the actual set of cvol_ids the cells reference. If the majority fail this check → fall back to sequential indexing.
+The `cvol_id` for each part is NOT the 1-based index — it's an opaque identifier in a post-name `[12, 4, X, 4]` descriptor chain (typically `[1, cvol_id]` where the trailing value is the real id).
 
-This logic is duplicated between `gph2cgns._parse_ls_parts_with_cvol_ids` and `gph_model.parse_ls_parts` and must stay in sync.
+**Canonical implementation**: `gph_model.parse_ls_parts(data, cvol_id=…)` (also imported by `gph2cgns` as `_parse_ls_parts_with_cvol_ids`). Algorithm:
+
+1. Parse `LS_CvolIdOfElements` first; its unique values form the authoritative set `S`.
+2. For each part, scan the full post-name `[12,4,X,4]` chain.
+3. Pick the **last** chain value that belongs to `S`.
+4. Globally validate uniqueness and coverage; fall back to sequential `1..N` only when `S == {1,…,N}`.
+
+Always pass the per-cell cvol array into `parse_ls_parts` when available (`gph_parser`, `gphviewer`, `gph2cgns` all do this).
 
 ### CGNS export layout (matching FLDUTIL)
 

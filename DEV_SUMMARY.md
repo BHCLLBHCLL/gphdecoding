@@ -624,7 +624,7 @@ box_ansa_orig.cgns (vendor)   : 35 448 B  superblock=0  OHDR=0   SNOD/TREE/HEAP=
 - `tr03`：Part 顺序与 cvol_id `{1,2}` 巧合一致  
 - `laptop`：Part 列表顺序对应 cvol_id **`{1, 9, 11}`**，而非 `{1, 2, 3}`
 
-**修复**：`_parse_ls_parts_with_cvol_ids()` 扫描每个 255 字节名块后的最后一个 `[12,4,X,4]` 描述符；Zone cell 掩码改为 `cvol_id == X`。
+**修复**：`parse_ls_parts()` 扫描每个 255 字节名块后的 post-name 描述符链，取链中属于 `LS_CvolIdOfElements` 实际集合的 cvol_id；Zone cell 掩码改为 `cvol_id == X`。（后续 §11.11 将算法统一为全局链扫描 + 全局校验，并消除 `gph2cgns` / `gph_model` 双份实现。）
 
 ### 10.4 多面体（混合单元）网格
 
@@ -789,6 +789,8 @@ conn     : 513041554 entries in 2 chunks
 
 ### 11.9 LS_Parts cvol_id 扫描首值 sanity check（#14）
 
+> **状态**：已被 §11.11 取代；以下保留作历史记录。
+
 **问题**：某些再保存 / 非典型 GPH 文件中，`_parse_ls_parts_with_cvol_ids` 的字节扫描会 latch 到 Part 名块之后第一个无关的 `[12, 4, X, 4]` 描述符（而非真正的 cvol_id 描述符），导致首个 Part 的 cvol_id 被识别为 `>1`（例如 `2`），下游 Zone cell 掩码错位。
 
 **经验事实**：合法文件中**首个 Part 的 cvol_id 恒为 `1`**：
@@ -817,6 +819,8 @@ conn     : 513041554 entries in 2 chunks
 ---
 
 ### 11.10 LS_Parts cvol_id 扫描值与 LS_CvolIdOfElements 交叉校验（#16）
+
+> **状态**：已被 §11.11 取代；以下保留作历史记录。
 
 **问题**：§11.9 中"首值 > 1 才回退顺序索引"的规则在更大模型（>1e7 cells、多 Part、re-saved 文件）上仍不够稳健——字节扫描可能恰好把首 Part 扫成 `1`（误把 Part 描述符链上的某个无关 `[12, 4, 1, 4]` marker 当作 cvol_id），但后续 Part 的扫描值仍为垃圾值，下游 `_classify_zone_cells` 在 `cvol_id == name_to_cvol[part]` 上得到全 0 掩码，对应 Zone 被丢空。
 
@@ -853,6 +857,62 @@ if use_sequential and not all(1..N in actual_set):
 ```
 
 向后兼容：`cvol_id` 形参为可选；不传时退化为 §11.9 的纯首值规则。
+
+---
+
+### 11.11 LS_Parts cvol_id 全局描述符链扫描（#17）
+
+**问题**：§11.9 / §11.10 的双启发式（首值必须为 `1`、多数值须落在 `LS_CvolIdOfElements` 集合、否则回退顺序 $1..N$）在不同 GPH 样例间行为不一致：
+
+- 对 `{1, 9, 11}` 等非连续 id，顺序回退 $1..N$ 会产生错误映射；
+- 「无条件取 post-name 区域最后一个 `[12,4,X,4]`」会把 marker `1` 与真实 cvol_id 混淆（实测链为 `[1, cvol_id]`）；
+- `gph2cgns._parse_ls_parts_with_cvol_ids` 与 `gph_model.parse_ls_parts` 各维护 ~140 行重复逻辑，易漂移。
+
+**新算法**（`gph_model._resolve_part_cvol_ids`，由 `parse_ls_parts` 调用）：
+
+1. 以 `LS_CvolIdOfElements` 唯一值集合 $S$ 为权威来源（调用方应先解析 cvol 数组并传入 `cvol_id=`）。
+2. 对每个 Part 名块，全局扫描 post-name 区域完整 `[12,4,X,4]` 链（`_scan_cvol_descriptor_chain`）。
+3. **主规则**：取链中**最后一个** $x \in S$ 作为该 Part 的 cvol_id。
+4. **全局校验**：assigned ids 唯一；当 $|S|=N$ 时须 $S = \{\text{assigned}\}$。
+5. **回退**：单候选 → 顺序 $1..N$（仅当 $S=\{1,\dots,N\}$）→ 链末元素 → best-effort。
+
+**代码整合**：
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph_model.py` | 新增 `_ls_parts_name_blocks`、`_scan_cvol_descriptor_chain`、`_resolve_part_cvol_ids`；重写 `parse_ls_parts` |
+| `gph2cgns.py` | 删除重复 `_parse_ls_parts_with_cvol_ids`；`from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids` |
+| `gph_parser.py` | `format_description()` §10 改写为新算法说明 |
+| `gphviewer.py` | 所有 `parse_ls_parts` 调用均传入 `cvol_id=` |
+| `GPH_FORMAT_SPEC.md` | §5.6 改写；§5.1 引用更新 |
+| `CLAUDE.md` | Architecture / cvol_id 段落更新 |
+
+**验证**（仓库内全部 12 个 `.gph` 样例）：
+
+| 样例 | actual cvol_ids | 映射结果 |
+|------|-----------------|----------|
+| `tr03.gph` | `{1, 2}` | Case→1, Rotate→2 |
+| `laptop_simplified_voxel_less.gph` | `{1, 9, 11}` | air→1, rotation1→9, rotation2→11 |
+| `laptop_simplified.gph` | `{1, 2, 4}` | air→1, rotation1→4, rotation2→2 |
+| `laptop_simplified_voxel_v5/v6.gph` | `{1, 2, 3}` | 顺序 id |
+
+**判定流程**（伪代码）：
+
+```text
+actual_set = unique(LS_CvolIdOfElements)
+for each part:
+    chain = scan [12,4,X,4] between this name block and the next
+    cvol_id = last x in chain where x in actual_set  (else last in chain)
+
+if mapping unique and covers actual_set:
+    return mapping
+elif each part has exactly one candidate in actual_set:
+    return those
+elif actual_set == {1..N}:
+    return sequential 1..N
+else:
+    return best-effort primary mapping
+```
 
 ---
 

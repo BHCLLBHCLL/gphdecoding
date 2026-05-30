@@ -378,8 +378,8 @@ class GphViewerMain(QMainWindow):
                 parts.append(f"conn_split×{chunks}")
             elif not links.get("conn_complete", True):
                 parts.append("conn_INCOMPLETE")
-        pmeta = parse_ls_parts(data)
         cvol = parse_ls_cvol_ids(data)
+        pmeta = parse_ls_parts(data, cvol_id=cvol)
         n_cells = links["n_cells"] if links else (len(cvol) if cvol is not None else 0)
         if pmeta and cvol is not None and len(cvol) == n_cells:
             for pname, cv in pmeta:
@@ -611,7 +611,7 @@ class GphViewerMain(QMainWindow):
             cvol = parse_ls_cvol_ids(data)
             if cvol is not None:
                 lines.append(f"Per-cell array length: {len(cvol)}")
-                for pname, cv in parse_ls_parts(data):
+                for pname, cv in parse_ls_parts(data, cvol_id=cvol):
                     lines.append(f"  {pname} (cvol_id={cv}): {int((cvol == cv).sum())} cells")
 
         if node.name == "LS_Links":
@@ -635,7 +635,7 @@ class GphViewerMain(QMainWindow):
         if node.name == "LS_Parts":
             cvol = parse_ls_cvol_ids(data)
             if cvol is not None:
-                for pname, cv in parse_ls_parts(data):
+                for pname, cv in parse_ls_parts(data, cvol_id=cvol):
                     lines.append(f"  {pname}: cvol_id={cv}, cells={int((cvol == cv).sum())}")
 
         return lines
