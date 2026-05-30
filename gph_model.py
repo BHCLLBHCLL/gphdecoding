@@ -389,30 +389,10 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
     }
 
 
-def parse_ls_parts(
-    data: bytes,
-    cvol_id: Optional["np.ndarray"] = None,
-) -> list[tuple[str, int]]:
-    """Parse LS_Parts → [(part_name, cvol_id), ...] (see gph2cgns).
-
-    On well-formed files the first part's cvol_id is always 1 (box_ansa: [1],
-    tr03: [1, 2], laptop: [1, 9, 11]).  On some re-saved/malformed files the
-    byte scan can latch onto an unrelated [12,4,X,4] descriptor and return a
-    first value > 1; in that case fall back to sequential 1-based indexing
-    (mirrors ``gph2cgns._parse_ls_parts_with_cvol_ids``).
-
-    ``cvol_id`` (optional) is the per-cell array parsed from
-    ``LS_CvolIdOfElements``.  When provided the parser also cross-checks each
-    scanned value against the actual set of cvol_ids used by the mesh — on
-    larger / re-saved files the first-value heuristic alone is not enough
-    (the scan can yield 1 for the first part by coincidence yet garbage for
-    the rest).  If the majority of scanned values are not present in that
-    set the parser falls back to sequential indexing.
-    """
-    sec_start = find_section(data, "LS_Parts")
-    if sec_start < 0:
-        return []
-    sec_end = section_end(data, sec_start)
+def _ls_parts_name_blocks(
+    data: bytes, sec_start: int, sec_end: int,
+) -> list[tuple[str, int, int]]:
+    """Return ``[(name, name_header_pos, after_trailer_pos), ...]`` in file order."""
     name_blocks: list[tuple[str, int, int]] = []
     for p, bc in iter_data_blocks(data, sec_start, sec_end):
         if bc != 255:
@@ -424,47 +404,126 @@ def parse_ls_parts(
         if not name or not any(c.isalpha() for c in name):
             continue
         name_blocks.append((name, p - 8, p + bc + 4))
-    scanned: list[tuple[str, Optional[int]]] = []
+    return name_blocks
+
+
+def _scan_cvol_descriptor_chain(data: bytes, start: int, end: int) -> list[int]:
+    """Collect every ``[12, 4, X, 4]`` value in ``[start, end)`` in file order."""
+    chain: list[int] = []
+    pos = start
+    while pos + 16 <= end:
+        if (read_i32_be(data, pos) == 12
+                and read_i32_be(data, pos + 4) == 4
+                and read_i32_be(data, pos + 12) == 4):
+            chain.append(read_i32_be(data, pos + 8))
+        pos += 4
+    return chain
+
+
+def _resolve_part_cvol_ids(
+    parts: list[tuple[str, list[int]]],
+    actual_set: Optional[set[int]],
+) -> list[tuple[str, int]]:
+    """Map each Part name to a cvol_id using descriptor chains + global validation.
+
+    Each Part record stores a post-name descriptor chain that typically looks
+    like ``[1, <cvol_id>]`` (leading ``1`` markers plus the opaque id).  The
+    primary rule is therefore: pick the **last** chain value that belongs to
+    the mesh's actual cvol_id set (from ``LS_CvolIdOfElements``), not merely
+    the last ``[12,4,X,4]`` regardless of *X*.
+
+    When that primary mapping is not unique / does not cover the actual set,
+    fall back in order to: (a) exactly-one-candidate-per-part, (b) sequential
+    ``1..N`` only when the actual set is ``{1, …, N}``, (c) raw last chain
+    element, (d) best-effort primary picks.
+    """
+    n = len(parts)
+    if n == 0:
+        return []
+
+    def _pick_last_in_set(chain: list[int]) -> Optional[int]:
+        if not chain:
+            return None
+        if actual_set:
+            for value in reversed(chain):
+                iv = int(value)
+                if iv in actual_set:
+                    return iv
+        return int(chain[-1])
+
+    def _mapping_ok(mapping: list[tuple[str, Optional[int]]]) -> bool:
+        ids = [cv for _, cv in mapping if cv is not None]
+        if len(ids) != n or len(set(ids)) != n:
+            return False
+        if actual_set is None:
+            return True
+        if not set(ids) <= actual_set:
+            return False
+        return len(actual_set) != n or set(ids) == actual_set
+
+    primary = [(name, _pick_last_in_set(chain)) for name, chain in parts]
+    if _mapping_ok(primary):
+        return [(name, int(cv)) for name, cv in primary]
+
+    single: list[tuple[str, int]] = []
+    for name, chain in parts:
+        cands = [int(v) for v in chain
+                 if actual_set is None or int(v) in actual_set]
+        if len(cands) != 1:
+            break
+        single.append((name, cands[0]))
+    else:
+        if _mapping_ok(single):
+            return single
+
+    if actual_set is not None and actual_set == set(range(1, n + 1)):
+        return [(name, idx) for idx, (name, _) in enumerate(parts, start=1)]
+
+    raw_last = [(name, int(chain[-1])) for name, chain in parts if chain]
+    if len(raw_last) == n and _mapping_ok(raw_last):
+        return raw_last
+
+    out: list[tuple[str, int]] = []
+    for idx, (name, cv) in enumerate(primary, start=1):
+        out.append((name, int(cv) if cv is not None else idx))
+    return out
+
+
+def parse_ls_parts(
+    data: bytes,
+    cvol_id: Optional["np.ndarray"] = None,
+) -> list[tuple[str, int]]:
+    """Parse LS_Parts → ``[(part_name, cvol_id), ...]`` in file order.
+
+    The cvol_id of each Part is **not** its 1-based position in ``LS_Parts``.
+    It is encoded as the ``d0`` field of ``[12, 4, cvol_id, 4]`` descriptors
+    that follow the Part's 255-byte ASCII name block.  Empirically the chain
+    is ``[1, cvol_id]`` where the trailing value is the opaque scFLOW id
+    (``tr03``: ``{1, 2}``; ``laptop_simplified_voxel_less``: ``{1, 9, 11}``).
+
+    When ``cvol_id`` (the per-cell ``LS_CvolIdOfElements`` array) is supplied,
+    its unique values define the authoritative cvol_id set.  Each Part's id
+    is resolved by scanning the post-name descriptor chain globally and
+    choosing the last value that appears in that set, then validating the
+    full ``part → cvol_id`` mapping for uniqueness and coverage.
+    """
+    sec_start = find_section(data, "LS_Parts")
+    if sec_start < 0:
+        return []
+    sec_end = section_end(data, sec_start)
+    name_blocks = _ls_parts_name_blocks(data, sec_start, sec_end)
+
+    parts_with_chains: list[tuple[str, list[int]]] = []
     for i, (name, _, after_trailer) in enumerate(name_blocks):
         scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
-        scanned_cvol: Optional[int] = None
-        pos = after_trailer
-        while pos + 16 <= scan_end:
-            if (read_i32_be(data, pos) == 12
-                    and read_i32_be(data, pos + 4) == 4
-                    and read_i32_be(data, pos + 12) == 4):
-                scanned_cvol = read_i32_be(data, pos + 8)
-            pos += 4
-        scanned.append((name, scanned_cvol))
+        chain = _scan_cvol_descriptor_chain(data, after_trailer, scan_end)
+        parts_with_chains.append((name, chain))
 
-    first_valid = next((cid for _, cid in scanned if cid is not None), None)
-    use_sequential = first_valid is None or first_valid > 1
-
-    actual_set: Optional[set] = None
+    actual_set: Optional[set[int]] = None
     if cvol_id is not None and len(cvol_id) > 0:
         actual_set = {int(x) for x in np.unique(cvol_id)}
 
-    if not use_sequential and actual_set:
-        scanned_vals = [int(cid) for _, cid in scanned if cid is not None]
-        if scanned_vals:
-            in_set = sum(1 for cv in scanned_vals if cv in actual_set)
-            if in_set * 2 < len(scanned_vals):
-                use_sequential = True
-
-    sequential_ok = True
-    if use_sequential and actual_set is not None:
-        sequential_ok = all(idx in actual_set
-                            for idx in range(1, len(scanned) + 1))
-
-    out: list[tuple[str, int]] = []
-    for idx, (name, cid) in enumerate(scanned, start=1):
-        if use_sequential and sequential_ok:
-            out.append((name, idx))
-        elif cid is not None and (actual_set is None or int(cid) in actual_set):
-            out.append((name, int(cid)))
-        elif use_sequential:
-            out.append((name, idx))
-    return out
+    return _resolve_part_cvol_ids(parts_with_chains, actual_set)
 
 
 def parse_ls_string_list(data: bytes, section_name: str) -> list[str]:

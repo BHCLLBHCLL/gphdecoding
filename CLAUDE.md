@@ -1,0 +1,73 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+| Purpose | Command |
+|---------|---------|
+| Parse/inspect GPH format | `python3 gph_parser.py [file.gph]` |
+| Convert GPH → CGNS/HDF5 | `python3 gph2cgns.py input.gph -o output.cgns` |
+| Single-zone export | `python3 gph2cgns.py input.gph --single-zone -z ZoneName` |
+| GPH Viewer GUI | `python3 gphviewer.py [file.gph]` |
+| Headless viewer (CI/server) | `QT_QPA_PLATFORM=offscreen python3 gphviewer.py file.gph` |
+| Lint | `~/.local/bin/ruff check *.py` |
+| Syntax check | `python3 -m py_compile <file>.py` |
+
+**No test suite exists.** Validate the converter by running it on `box_ansa.gph` and comparing with the reference file `box_ansa_orig.cgns`.
+
+No build step — each script is a standalone entry-point run directly with `python3`.
+
+## Architecture
+
+This is a **flat Python CLI/GUI toolkit** for reverse-engineering and converting `.gph` files (proprietary CFD mesh format from Software Cradle scFLOW / SCTpre, magic `CRDL-FLD`, all integers/floats big-endian) into CGNS/HDF5. No web server, database, or services.
+
+### File roles
+
+- **`gph_model.py`** — Shared library: data types (`GphNode`, `GphDocument`), binary section scanners, heuristics for vertex-coordinate dialect detection, LS_Links/LS_Parts/LS_Assemblies parsers, mesh-preview builder. This is the single source of truth for GPH parsing logic.
+- **`gph2cgns.py`** — Converter: **duplicates** a subset of the parsing functions from `gph_model` (intentionally — it's a self-contained deployment target). Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility. Only imports `_read_conn_continuations` from `gph_model`.
+- **`gph_parser.py`** — CLI inspector: imports all parsing functions from `gph_model`, prints structured section layout and format description.
+- **`gphviewer.py`** — PyQt GUI browser/editor: imports parsing functions from `gph_model`, builds tree view + hex dump + data table + 3D mesh preview via `MeshPreviewWidget`.
+
+### Dependencies
+
+`numpy`, `h5py` (converter only), `PyQt6` (viewer; falls back to `PyQt5` on Python < 3.12). System library `libegl1` required for PyQt6 rendering in headless environments.
+
+## Key technical details
+
+### GPH section discovery
+
+Section offsets vary per file. All tools locate sections dynamically by scanning the buffer for 32-byte ASCII labels preceded by `[I4=32]`. The list of known section names is duplicated in `gph_model._SECTION_BOUNDARY_NAMES`, `gph2cgns._section_end`, and `gph_parser._parse_gph_buffer`. All three must stay in sync.
+
+### Vertex coordinate dialect auto-detection
+
+`LS_Nodes` contains three equal-sized float64 axis blocks (X, Y, Z file order). Two encodings exist:
+1. **Standard big-endian float64** (modern files from current ANSA/scFLOW pipelines)
+2. **Word-reversed float64** (legacy — each 8-byte double stored as `[low32_BE][high32_BE]`, and axes on disk are X, Z, Y)
+
+The parser decodes both and picks the one whose coordinate magnitudes look physically plausible (finite, magnitude ≤ 1e6, ≥ 1e-30).
+
+### LS_Links conn splitting (files > ~1 GiB connectivity)
+
+When `sum(npe)*4` exceeds ~1 GiB, the connectivity array is split into multiple segments. The first segment uses the standard `[12, bc][payload][bc]` block format; continuation chunks use bare `[I4=byte_count][payload]` (no `[I4=12]` header). `_read_conn_continuations` in `gph_model` handles concatenation. The converter imports this directly.
+
+### cvol_id heuristics in LS_Parts
+
+The `cvol_id` for each part is NOT the 1-based index — it's an opaque identifier recorded in a `[12, 4, cvol_id, 4]` descriptor after each part's 255-byte name block. Two complementary sanity checks guard the byte-scan:
+1. **First-value rule**: on well-formed files the first part's cvol_id is always 1. A first value > 1 is unreliable → fall back to sequential 1..N indexing.
+2. **Cross-check against LS_CvolIdOfElements**: each scanned cvol_id must belong to the actual set of cvol_ids the cells reference. If the majority fail this check → fall back to sequential indexing.
+
+This logic is duplicated between `gph2cgns._parse_ls_parts_with_cvol_ids` and `gph_model.parse_ls_parts` and must stay in sync.
+
+### CGNS export layout (matching FLDUTIL)
+
+- **NGON_n** for faces, **NFACE_n** for cells (signed face IDs: positive = owner, negative = neighbor)
+- Multi-zone layout inferred from `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies` XML
+- Surface regions map to `ZoneBC_t` with one `BC_t` per region; empty zones get BC nodes with no `data` dataset (matching the vendor exporter)
+- HDF5 v0 superblock with `track_order=False` groups for ANSA compatibility
+- Vertex renumbering by first-use order in face connectivity (matches FLDUTIL)
+- Zone naming: paths with depth ≥ 2 use the dotted path verbatim; shallower paths get an `FPHPARTS.` prefix
+
+### Memory-mapping
+
+Files larger than 512 MiB are memory-mapped (`mmap`) by all three tools rather than loaded into RAM. This makes multi-gigabyte meshes (~8 GiB `laptop_simplified_denser.gph`) inspectable. Large-file mmap mode is **read-only** — the viewer disables Save/Save As for mmap'd files.

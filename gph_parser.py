@@ -229,23 +229,13 @@ def format_description() -> str:
 -------------------------------
   Repeated records: 255-byte ASCII name block + trailing descriptors.
   The cvol_id is the d0 field of the last [12, 4, cvol_id, 4] descriptor
-  before the next part's name block.
+  in each Part's post-name descriptor chain (typically [1, cvol_id]).
 
-  Sanity checks (two complementary heuristics):
-    1. First-value rule: empirically the first part's cvol_id is always 1
-       on well-formed files (box_ansa [1], tr03 [1,2], laptop [1,9,11]).
-       A first value > 1 means the descriptor scan latched onto an
-       unrelated [12,4,X,4] and is unreliable → fall back to sequential
-       1-based indexing (1, 2, 3, ...).
-    2. Cross-check against LS_CvolIdOfElements: each scanned cvol_id must
-       belong to the actual unique-cvol_id set that the cells reference.
-       If the majority of scanned values are absent from that set the scan
-       is also unreliable (larger / re-saved models can satisfy rule 1 by
-       coincidence yet still produce garbage values for later parts) →
-       fall back to sequential indexing.
-  When the first scanned value is 1 and most scanned ids belong to the
-  actual set, the scanned values are trusted (legitimate non-contiguous
-  ids like {1, 9, 11} are preserved).
+  Resolution uses LS_CvolIdOfElements as the authoritative cvol_id set:
+  for each Part the parser picks the last chain value that belongs to that
+  set, then validates the full part→cvol_id mapping for uniqueness and
+  coverage.  Sequential 1-based indexing is used only when the actual set
+  is exactly {1, 2, …, N}.
 
 11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
 --------------------------------------------------------
