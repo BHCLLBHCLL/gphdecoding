@@ -55,16 +55,19 @@ When `sum(npe)*4` exceeds ~1 GiB, the connectivity array is split into multiple 
 
 ### cvol_id resolution in LS_Parts
 
-The `cvol_id` for each part is NOT the 1-based index — it's an opaque identifier in a post-name `[12, 4, X, 4]` descriptor chain (typically `[1, cvol_id]` where the trailing value is the real id).
+The `cvol_id` for each part is NOT the 1-based index. `parse_ls_parts` returns `PartCvolSpec = int | frozenset[int]`:
 
-**Canonical implementation**: `gph_model.parse_ls_parts(data, cvol_id=…)` (also imported by `gph2cgns` as `_parse_ls_parts_with_cvol_ids`). Algorithm:
+- **Simple part**: post-name chain `[1, cvol_id]` → single `int` (e.g. `outlet11` → 2).
+- **Composite part**: `[12,4,N,4]` + `I4[N]` membership list → `frozenset` (e.g. `air_domain` in `laptop_simplified_more_regions.gph` owns 66 ids, 151375 cells). **Do not** treat `N` as a cvol_id.
 
-1. Parse `LS_CvolIdOfElements` first; its unique values form the authoritative set `S`.
-2. For each part, scan the full post-name `[12,4,X,4]` chain.
-3. Pick the **last** chain value that belongs to `S`.
-4. Globally validate uniqueness and coverage; fall back to sequential `1..N` only when `S == {1,…,N}`.
+**Canonical implementation**: `gph_model.parse_ls_parts(data, cvol_id=…)` (imported by `gph2cgns` as `_parse_ls_parts_with_cvol_ids`). Zone masks use `part_cvol_cell_mask(cvol_id, spec)`.
 
-Always pass the per-cell cvol array into `parse_ls_parts` when available (`gph_parser`, `gphviewer`, `gph2cgns` all do this).
+1. Parse `LS_CvolIdOfElements` first; unique values form set `S`.
+2. Detect composite layout (`_parse_part_cvol_membership`) before single-id chain rule.
+3. Simple parts: last chain value in `S`.
+4. Always pass the per-cell cvol array when available.
+
+Test composite cases: `python tests/test_volume_zone_cells.py -v tests/laptop_simplified_more_regions.gph`
 
 ### CGNS export layout (matching FLDUTIL)
 

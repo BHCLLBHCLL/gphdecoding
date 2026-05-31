@@ -14,7 +14,7 @@ Reverse-engineer and convert **GPH** (Software Cradle scFLOW / SCTpre CFD mesh) 
 | **DEV_SUMMARY.md** | Development log and design decisions |
 | **tests/test_volume_zone_cells.py** | Partition regression test (GPH zone plan vs `*_orig.cgns`) |
 
-Sample meshes: `tests/box_ansa.gph`, `tests/laptop_simplified_voxel_less.gph` (with `*_orig.cgns` references); larger files `tr03.gph`, `laptop_simplified*.gph` in repo root.
+Sample meshes: `tests/box_ansa.gph`, `tests/laptop_simplified_voxel_less.gph`, `tests/laptop_simplified_more_regions.gph` (composite `air_domain` Part); matching `*_orig.cgns` where present.
 
 ## Usage
 
@@ -34,10 +34,10 @@ Requires: `pip install numpy h5py`
 ### Test volume-zone cell counts
 ```bash
 python tests/test_volume_zone_cells.py          # all tests/*.gph vs *_orig.cgns
-python tests/test_volume_zone_cells.py -v       # + LS_Parts chains, cvol_id details
-python tests/test_volume_zone_cells.py -v tests/box_ansa.gph
+python tests/test_volume_zone_cells.py -v       # + LS_Parts chains, composite membership lists
+python tests/test_volume_zone_cells.py -v tests/laptop_simplified_more_regions.gph
 ```
-Compares each GPH file's zone plan against a matching `{stem}_orig.cgns` reference when present.
+Compares each GPH file's zone plan against a matching `{stem}_orig.cgns` when present. Composite Parts (`air_domain` with 66 cvol_ids) are validated via `part_cvol_cell_mask`.
 
 ### GPH Viewer (GUI)
 ```bash

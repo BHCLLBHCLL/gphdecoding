@@ -81,6 +81,8 @@ from gph_model import (
     parse_ls_parts,
     parse_ls_surface_regions,
     parse_ls_string_list,
+    part_cvol_cell_mask,
+    format_part_cvol_spec,
 )
 
 
@@ -470,11 +472,13 @@ class GphViewerMain(QMainWindow):
             item = QTreeWidgetItem([node.name, node.data_type, "virtual", ""])
             item.setData(0, 100, node)
             vol_item.addChild(item)
-        for name, cvol_id in self._parts:
-            count = int((self._cvol_ids == cvol_id).sum()) if self._cvol_ids is not None else 0
+        for name, cvol_spec in self._parts:
+            count = (int(part_cvol_cell_mask(self._cvol_ids, cvol_spec).sum())
+                     if self._cvol_ids is not None else 0)
             node = GphNode(
-                f"Part: {name}", 0, 0, "volume part", f"cvol_id={cvol_id}, cells={count}",
-                metadata={"view_kind": "volume_part", "cvol_id": cvol_id},
+                f"Part: {name}", 0, 0, "volume part",
+                f"cvol={format_part_cvol_spec(cvol_spec)}, cells={count}",
+                metadata={"view_kind": "volume_part", "cvol_spec": cvol_spec},
             )
             item = QTreeWidgetItem([node.name, node.data_type, "virtual", str(count)])
             item.setData(0, 100, node)
@@ -612,7 +616,8 @@ class GphViewerMain(QMainWindow):
             if cvol is not None:
                 lines.append(f"Per-cell array length: {len(cvol)}")
                 for pname, cv in parse_ls_parts(data, cvol_id=cvol):
-                    lines.append(f"  {pname} (cvol_id={cv}): {int((cvol == cv).sum())} cells")
+                    n = int(part_cvol_cell_mask(cvol, cv).sum())
+                    lines.append(f"  {pname} (cvol={format_part_cvol_spec(cv)}): {n} cells")
 
         if node.name == "LS_Links":
             summary = parse_ls_links_summary(data)
@@ -636,7 +641,8 @@ class GphViewerMain(QMainWindow):
             cvol = parse_ls_cvol_ids(data)
             if cvol is not None:
                 for pname, cv in parse_ls_parts(data, cvol_id=cvol):
-                    lines.append(f"  {pname}: cvol_id={cv}, cells={int((cvol == cv).sum())}")
+                    n = int(part_cvol_cell_mask(cvol, cv).sum())
+                    lines.append(f"  {pname}: cvol={format_part_cvol_spec(cv)}, cells={n}")
 
         return lines
 
@@ -658,8 +664,11 @@ class GphViewerMain(QMainWindow):
                 selected_faces.append(np.asarray(meta.get("face_ids", []), dtype=np.int64))
                 labels.append(node.name)
             elif kind == "volume_part" and self._cvol_ids is not None:
-                cvol_id = meta.get("cvol_id")
-                selected_cells.append(np.flatnonzero(self._cvol_ids == cvol_id))
+                cvol_spec = meta.get("cvol_spec", meta.get("cvol_id"))
+                if cvol_spec is not None:
+                    selected_cells.append(
+                        np.flatnonzero(part_cvol_cell_mask(self._cvol_ids, cvol_spec))
+                    )
                 labels.append(node.name)
             elif kind == "volume_region":
                 summary = parse_ls_links_summary(self.doc._raw_data)

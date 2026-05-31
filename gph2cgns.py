@@ -21,6 +21,7 @@ import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
 from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
+from gph_model import part_cvol_cell_mask, PartCvolSpec
 
 try:
     import h5py
@@ -613,13 +614,15 @@ def _parse_ls_assemblies(data: bytes) -> dict:
 
 
 def _classify_zone_cells(zone_name: str,
-                          parts_with_cvol: list[tuple[str, int]],
+                          parts_with_cvol: list[tuple[str, PartCvolSpec]],
                           cvol_id: Optional[np.ndarray], n_cells: int) -> np.ndarray:
     """Return a boolean cell-mask selecting cells that belong to *zone_name*.
 
     Cell membership is derived from the ``LS_CvolIdOfElements`` array and a
-    name-based heuristic over *parts_with_cvol*, the ``[(part_name, cvol_id)]``
-    list parsed from ``LS_Parts``.  ``cvol_id`` is the array of per-cell IDs
+    name-based heuristic over *parts_with_cvol*, the ``[(part_name, PartCvolSpec)]``
+    list parsed from ``LS_Parts``.  ``PartCvolSpec`` is either a single cvol_id
+    (``int``) or a ``frozenset`` of ids for composite Parts (e.g. ``air_domain``).
+    ``cvol_id`` is the array of per-cell IDs
     that may be sparse / non-sequential (e.g. tr03 uses ``{1, 2}`` but
     laptop_simplified_voxel_less uses ``{1, 9, 11}``); the mapping
     ``part → cvol_id`` is read from the part descriptors directly so the
@@ -647,14 +650,14 @@ def _classify_zone_cells(zone_name: str,
         rem = zone_name[len("@VPartRegion_") :]
         rem = rem.split("[", 1)[0]
         if rem in name_to_cvol:
-            return cvol_id == name_to_cvol[rem]
+            return part_cvol_cell_mask(cvol_id, name_to_cvol[rem])
 
     # `FPHPARTS.<...>.<part>` — the trailing component is the part name
     if zone_name.startswith("FPHPARTS."):
         suffix = zone_name[len("FPHPARTS.") :]
         candidate = suffix.rsplit(".", 1)[-1]
         if candidate in name_to_cvol:
-            return cvol_id == name_to_cvol[candidate]
+            return part_cvol_cell_mask(cvol_id, name_to_cvol[candidate])
 
     # General substring fallback: pick the longest Part name that appears
     # inside the zone name (longer names are more specific).
@@ -663,7 +666,7 @@ def _classify_zone_cells(zone_name: str,
         key=len, reverse=True,
     )
     if matches:
-        return cvol_id == name_to_cvol[matches[0]]
+        return part_cvol_cell_mask(cvol_id, name_to_cvol[matches[0]])
     return all_mask
 
 
@@ -1216,7 +1219,7 @@ def _build_zone_plan(mesh: dict,
     link_data = mesh["link_data"]
     n_cells = int(link_data["n_cells"])
     cvol_id = mesh.get("cvol_id")
-    parts_with_cvol: list[tuple[str, int]] = mesh.get("parts_with_cvol", [])
+    parts_with_cvol: list[tuple[str, PartCvolSpec]] = mesh.get("parts_with_cvol", [])
     regions = mesh.get("volume_regions", [])
     asm_info = mesh.get("assembly_info", {})
     part_paths: dict[str, Optional[str]] = asm_info.get("part_paths", {}) if isinstance(asm_info, dict) else {}
@@ -1286,11 +1289,12 @@ def _build_zone_plan(mesh: dict,
             return path
         return f"FPHPARTS.{path}"
 
-    for part, cvol in parts_with_cvol:
+    for part, cvol_spec in parts_with_cvol:
         zone_name = _zone_name_for_part(part)
-        mask = ((cvol_id == cvol)
-                if (cvol_id is not None and len(cvol_id) == n_cells)
-                else np.ones(n_cells, dtype=bool))
+        if cvol_id is not None and len(cvol_id) == n_cells:
+            mask = part_cvol_cell_mask(cvol_id, cvol_spec)
+        else:
+            mask = np.ones(n_cells, dtype=bool)
         plan.append((zone_name, mask))
 
     return plan

@@ -420,6 +420,75 @@ def _scan_cvol_descriptor_chain(data: bytes, start: int, end: int) -> list[int]:
     return chain
 
 
+# Part → either one cvol_id or a membership set (composite / background parts).
+PartCvolSpec = int | frozenset[int]
+
+
+def format_part_cvol_spec(spec: PartCvolSpec) -> str:
+    if isinstance(spec, frozenset):
+        ids = sorted(spec)
+        if len(ids) <= 10:
+            return "{" + ", ".join(str(i) for i in ids) + "}"
+        return f"{{{ids[0]}..{ids[-1]} ... n={len(ids)}}}"
+    return str(spec)
+
+
+def part_cvol_cell_mask(cvol_id: "np.ndarray", spec: PartCvolSpec) -> "np.ndarray":
+    """Boolean mask of cells belonging to a Part (single id or id set)."""
+    if isinstance(spec, frozenset):
+        if not spec:
+            return np.zeros(len(cvol_id), dtype=bool)
+        return np.isin(cvol_id, list(spec))
+    return cvol_id == spec
+
+
+def _parse_part_cvol_membership(
+    data: bytes,
+    start: int,
+    end: int,
+    actual_set: Optional[set[int]],
+) -> Optional[frozenset[int]]:
+    """Parse composite Part layout: ``[12,4,N,4]`` + ``I4[N]`` cvol_id list.
+
+    Used by background parts such as ``air_domain`` in multi-region laptop
+    models: ``N`` is the list length (not a cvol_id), followed by the full
+    set of cvol_ids owned by that Part.
+    """
+    chain = _scan_cvol_descriptor_chain(data, start, end)
+    if not chain:
+        return None
+    chain_counts = set(chain)
+    for p, bc in iter_data_blocks(data, start, end):
+        if bc < 8 or bc % 4 != 0:
+            continue
+        n = bc // 4
+        if n not in chain_counts:
+            continue
+        vals = [int(x) for x in np.frombuffer(data, dtype=">i4", count=n, offset=p)]
+        if len(vals) != n or len(set(vals)) != n:
+            continue
+        if actual_set is not None and not all(v in actual_set for v in vals):
+            continue
+        if n >= 2:
+            return frozenset(vals)
+    return None
+
+
+def _resolve_single_part_cvol(
+    chain: list[int],
+    actual_set: Optional[set[int]],
+) -> int:
+    """Map a simple ``[1, cvol_id]`` descriptor chain to one cvol_id."""
+    if not chain:
+        return 1
+    if actual_set:
+        for value in reversed(chain):
+            iv = int(value)
+            if iv in actual_set:
+                return iv
+    return int(chain[-1])
+
+
 def _resolve_part_cvol_ids(
     parts: list[tuple[str, list[int]]],
     actual_set: Optional[set[int]],
@@ -492,20 +561,14 @@ def _resolve_part_cvol_ids(
 def parse_ls_parts(
     data: bytes,
     cvol_id: Optional["np.ndarray"] = None,
-) -> list[tuple[str, int]]:
-    """Parse LS_Parts → ``[(part_name, cvol_id), ...]`` in file order.
+) -> list[tuple[str, PartCvolSpec]]:
+    """Parse LS_Parts → ``[(part_name, cvol_spec), ...]`` in file order.
 
-    The cvol_id of each Part is **not** its 1-based position in ``LS_Parts``.
-    It is encoded as the ``d0`` field of ``[12, 4, cvol_id, 4]`` descriptors
-    that follow the Part's 255-byte ASCII name block.  Empirically the chain
-    is ``[1, cvol_id]`` where the trailing value is the opaque scFLOW id
-    (``tr03``: ``{1, 2}``; ``laptop_simplified_voxel_less``: ``{1, 9, 11}``).
-
-    When ``cvol_id`` (the per-cell ``LS_CvolIdOfElements`` array) is supplied,
-    its unique values define the authoritative cvol_id set.  Each Part's id
-    is resolved by scanning the post-name descriptor chain globally and
-    choosing the last value that appears in that set, then validating the
-    full ``part → cvol_id`` mapping for uniqueness and coverage.
+    ``cvol_spec`` is either a single **cvol_id** (``int``) or a ``frozenset``
+    of ids for composite Parts.  Simple parts use a post-name chain
+    ``[1, cvol_id]``; background parts (e.g. ``air_domain`` in multi-region
+    laptop meshes) store ``[12,4,N,4]`` where *N* is the list length, then
+    an ``I4[N]`` block listing every cvol_id that belongs to the Part.
     """
     sec_start = find_section(data, "LS_Parts")
     if sec_start < 0:
@@ -513,17 +576,22 @@ def parse_ls_parts(
     sec_end = section_end(data, sec_start)
     name_blocks = _ls_parts_name_blocks(data, sec_start, sec_end)
 
-    parts_with_chains: list[tuple[str, list[int]]] = []
-    for i, (name, _, after_trailer) in enumerate(name_blocks):
-        scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
-        chain = _scan_cvol_descriptor_chain(data, after_trailer, scan_end)
-        parts_with_chains.append((name, chain))
-
     actual_set: Optional[set[int]] = None
     if cvol_id is not None and len(cvol_id) > 0:
         actual_set = {int(x) for x in np.unique(cvol_id)}
 
-    return _resolve_part_cvol_ids(parts_with_chains, actual_set)
+    out: list[tuple[str, PartCvolSpec]] = []
+    for i, (name, _, after_trailer) in enumerate(name_blocks):
+        scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
+        membership = _parse_part_cvol_membership(
+            data, after_trailer, scan_end, actual_set,
+        )
+        if membership is not None:
+            out.append((name, membership))
+            continue
+        chain = _scan_cvol_descriptor_chain(data, after_trailer, scan_end)
+        out.append((name, _resolve_single_part_cvol(chain, actual_set)))
+    return out
 
 
 def parse_ls_string_list(data: bytes, section_name: str) -> list[str]:
@@ -633,7 +701,7 @@ def parse_ls_assemblies_summary(data: bytes) -> dict:
 
 def classify_volume_region_cells(
     zone_name: str,
-    parts_with_cvol: list[tuple[str, int]],
+    parts_with_cvol: list[tuple[str, PartCvolSpec]],
     cvol_id: Optional["np.ndarray"],
     n_cells: int,
 ) -> "np.ndarray":
@@ -648,18 +716,18 @@ def classify_volume_region_cells(
     if zone_name.startswith("@VPartRegion_"):
         rem = zone_name[len("@VPartRegion_") :].split("[", 1)[0]
         if rem in name_to_cvol:
-            return cvol_id == name_to_cvol[rem]
+            return part_cvol_cell_mask(cvol_id, name_to_cvol[rem])
     if zone_name.startswith("FPHPARTS."):
         candidate = zone_name[len("FPHPARTS.") :].rsplit(".", 1)[-1]
         if candidate in name_to_cvol:
-            return cvol_id == name_to_cvol[candidate]
+            return part_cvol_cell_mask(cvol_id, name_to_cvol[candidate])
     matches = sorted(
         (p for p, _ in parts_with_cvol if p and p in zone_name),
         key=len,
         reverse=True,
     )
     if matches:
-        return cvol_id == name_to_cvol[matches[0]]
+        return part_cvol_cell_mask(cvol_id, name_to_cvol[matches[0]])
     return all_mask
 
 
@@ -1052,7 +1120,7 @@ class GphDocument:
         if name == "LS_Parts":
             cvol_arr_for_parts = parse_ls_cvol_ids(file_data)
             parts = parse_ls_parts(file_data, cvol_id=cvol_arr_for_parts)
-            val = [f"{p} (cvol_id={cv})" for p, cv in parts]
+            val = [f"{p} (cvol={format_part_cvol_spec(cv)})" for p, cv in parts]
             return GphNode(name, offset, len(raw),
                            f"parts[{len(parts)}]", value=val, raw=raw, children=[])
 

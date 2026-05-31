@@ -21,6 +21,7 @@ from gph_model import (
     parse_ls_parts,
     parse_ls_string_list,
     parse_ls_surface_regions_summary,
+    format_part_cvol_spec,
     read_i32_be,
 )
 
@@ -98,7 +99,9 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
 
     parts = parse_ls_parts(data, cvol_id=cvol)
     if parts:
-        result["partition"]["LS_Parts"] = parts
+        result["partition"]["LS_Parts"] = [
+            f"{name} (cvol={format_part_cvol_spec(cv)})" for name, cv in parts
+        ]
 
     regions = parse_ls_string_list(data, "LS_VolumeRegions")
     if regions:
@@ -130,7 +133,7 @@ def _section_blurb(name: str) -> str:
         "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
         "LS_SurfaceRegions": "named BC regions -> global face id lists",
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
-        "LS_Parts": "part names + post-name cvol_id descriptor chains (see format_description §10)",
+        "LS_Parts": "part names + cvol spec (single id or membership list; see format_description §10)",
         "LS_Assemblies": "XML assembly tree for zone naming",
         "LS_SolverUnusedRegions": "solver-internal region names",
         "Element_InformationFlag": "per-element flags",
@@ -221,22 +224,36 @@ def format_description() -> str:
 
 9. LS_CvolIdOfElements - per-cell partition id
 ----------------------------------------------
-  I4[n_cells]: each cell's cvol_id matches the opaque id stored in the
-  corresponding LS_Parts descriptor - NOT the 1-based index in LS_Parts.
+  I4[n_cells]: one cvol_id per volume cell — the opaque Part label stored in
+  LS_Parts (NOT the 1-based index in the Part list).
   Example: laptop_simplified_voxel_less.gph uses cvol_ids {1, 9, 11}.
+  Multi-region laptop models may use dozens of distinct cvol_ids (geometry
+  sub-blocks); a single Part (e.g. air_domain) may own many of them via an
+  explicit membership list (see §10).
 
 10. LS_Parts - part definitions
 -------------------------------
-  Repeated records: 255-byte ASCII name block + post-name descriptor chain.
-  Empirically the chain is [1, cvol_id] — leading 1 is a marker; the
-  trailing value is the opaque scFLOW Part id.
+  Repeated records: 255-byte ASCII name block + post-name byte region.
 
-  Resolution (gph_model.parse_ls_parts, shared by gph2cgns/gphviewer):
-  parse LS_CvolIdOfElements first; its unique values are the authoritative
-  cvol_id set.  For each Part pick the last chain value belonging to that
-  set, then validate the full part→cvol_id mapping for uniqueness and
-  coverage.  Sequential 1-based indexing is used only when the actual set
-  is exactly {1, 2, …, N}.
+  **Simple Part** (one cvol_id): post-name chain is typically [1, cvol_id]
+  — leading 1 is a marker; the trailing value is the opaque scFLOW id.
+  Examples: outlet11 -> [1,2]; rotation1 -> [1,7].
+
+  **Composite Part** (many cvol_ids): background fluid parts such as
+  air_domain in laptop_simplified_more_regions.gph use:
+    [12,4,N,4]   N = length of the following list (NOT a cvol_id)
+    I4[N]        explicit list of cvol_ids belonging to this Part
+  Zone cells = all entries in LS_CvolIdOfElements whose value is in that set.
+
+  Resolution (gph_model.parse_ls_parts -> PartCvolSpec = int | frozenset):
+  1. Parse LS_CvolIdOfElements first; unique values form authoritative set S.
+  2. For each Part, if [12,4,N,4] + I4[N] membership is present, return
+     frozenset(members).
+  3. Else pick the last [12,4,X,4] chain value in S (simple Part rule).
+  4. gph2cgns / gphviewer use part_cvol_cell_mask() for zone cell masks.
+
+  Helpers: format_part_cvol_spec(), part_cvol_cell_mask().
+  Test: python tests/test_volume_zone_cells.py -v tests/laptop_simplified_more_regions.gph
 
 11. LS_VolumeRegions / LS_Assemblies / LS_SurfaceRegions
 --------------------------------------------------------

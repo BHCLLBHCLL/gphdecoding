@@ -624,7 +624,7 @@ box_ansa_orig.cgns (vendor)   : 35 448 B  superblock=0  OHDR=0   SNOD/TREE/HEAP=
 - `tr03`：Part 顺序与 cvol_id `{1,2}` 巧合一致  
 - `laptop`：Part 列表顺序对应 cvol_id **`{1, 9, 11}`**，而非 `{1, 2, 3}`
 
-**修复**：`parse_ls_parts()` 扫描每个 255 字节名块后的 post-name 描述符链，取链中属于 `LS_CvolIdOfElements` 实际集合的 cvol_id；Zone cell 掩码改为 `cvol_id == X`。（后续 §11.11 将算法统一为全局链扫描 + 全局校验，并消除 `gph2cgns` / `gph_model` 双份实现。）
+**修复**：`parse_ls_parts()` 扫描 post-name 区；简单 Part 取链中属于 `LS_CvolIdOfElements` 实际集合的 cvol_id；复合 Part 解析 `I4[N]` 成员列表（§11.12）。Zone cell 掩码改为 `part_cvol_cell_mask(cvol_id, spec)`。
 
 ### 10.4 多面体（混合单元）网格
 
@@ -868,13 +868,13 @@ if use_sequential and not all(1..N in actual_set):
 - 「无条件取 post-name 区域最后一个 `[12,4,X,4]`」会把 marker `1` 与真实 cvol_id 混淆（实测链为 `[1, cvol_id]`）；
 - `gph2cgns._parse_ls_parts_with_cvol_ids` 与 `gph_model.parse_ls_parts` 各维护 ~140 行重复逻辑，易漂移。
 
-**新算法**（`gph_model._resolve_part_cvol_ids`，由 `parse_ls_parts` 调用）：
+**新算法**（`gph_model.parse_ls_parts`，2026-05 已演进，见 §11.12 复合 Part）：
 
 1. 以 `LS_CvolIdOfElements` 唯一值集合 $S$ 为权威来源（调用方应先解析 cvol 数组并传入 `cvol_id=`）。
 2. 对每个 Part 名块，全局扫描 post-name 区域完整 `[12,4,X,4]` 链（`_scan_cvol_descriptor_chain`）。
-3. **主规则**：取链中**最后一个** $x \in S$ 作为该 Part 的 cvol_id。
-4. **全局校验**：assigned ids 唯一；当 $|S|=N$ 时须 $S = \{\text{assigned}\}$。
-5. **回退**：单候选 → 顺序 $1..N$（仅当 $S=\{1,\dots,N\}$）→ 链末元素 → best-effort。
+3. **简单 Part 主规则**：取链中**最后一个** $x \in S$ 作为该 Part 的 cvol_id。
+4. **复合 Part**：若存在 `[12,4,N,4]` + `I4[N]` 成员列表，返回 `frozenset`（§11.12）。
+5. Zone 掩码统一经 `part_cvol_cell_mask(cvol_id, spec)`。
 
 **代码整合**：
 
@@ -886,7 +886,7 @@ if use_sequential and not all(1..N in actual_set):
 | `gphviewer.py` | 所有 `parse_ls_parts` 调用均传入 `cvol_id=` |
 | `GPH_FORMAT_SPEC.md` | §5.6 改写；§5.1 引用更新 |
 | `CLAUDE.md` | Architecture / cvol_id 段落更新 |
-| `tests/test_volume_zone_cells.py` | 新增：遍历 `tests/*.gph`，对比 `{stem}_orig.cgns` 体区域 cell 数；`-v` 输出 LS_Parts 链 / cvol_id 直方图 |
+| `tests/test_volume_zone_cells.py` | 新增：遍历 `tests/*.gph`，对比 `{stem}_orig.cgns` 体区域 cell 数；`-v` 输出 LS_Parts 链 / cvol_id 直方图 / 复合 Part |
 
 **验证**（`tests/` 目录 + 仓库根目录 `.gph` 样例）：
 
@@ -897,23 +897,70 @@ if use_sequential and not all(1..N in actual_set):
 | `laptop_simplified.gph` | `{1, 2, 4}` | air→1, rotation1→4, rotation2→2 |
 | `laptop_simplified_voxel_v5/v6.gph` | `{1, 2, 3}` | 顺序 id |
 
-**判定流程**（伪代码）：
+**判定流程**（简单 Part；复合 Part 见 §11.12）：
 
 ```text
 actual_set = unique(LS_CvolIdOfElements)
 for each part:
-    chain = scan [12,4,X,4] between this name block and the next
-    cvol_id = last x in chain where x in actual_set  (else last in chain)
-
-if mapping unique and covers actual_set:
-    return mapping
-elif each part has exactly one candidate in actual_set:
-    return those
-elif actual_set == {1..N}:
-    return sequential 1..N
-else:
-    return best-effort primary mapping
+    if [12,4,N,4] + I4[N] membership present:
+        spec = frozenset(members)
+    else:
+        chain = scan [12,4,X,4] between this name block and the next
+        spec = last x in chain where x in actual_set
+zone_mask = part_cvol_cell_mask(cvol_id, spec)
 ```
+
+---
+
+### 11.12 LS_Parts 复合 Part cvol_id 成员列表（#18）
+
+**问题**：`laptop_simplified_more_regions.gph`（173 094 cells，**70** 个不同 cvol_id）中，命名 Part `outlet11/outlet21/rotation1/rotation2` 各占单一 id `{2,3,4,7}`（21 719 cells），但 `air_domain` 应含**其余 66 个 id** 共 151 375 cells。
+
+§11.11 的简单 Part 规则将 `air_domain` post-name 区 `[12,4,66,4]` 中的 **66 误判为 cvol_id**（mesh 中 cvol_id=66 仅 30 cells），导致 Zone 严重偏小。
+
+**根因**：多区域 laptop 模型中，背景流体 Part 不使用 `[1, cvol_id]` 单 id 布局，而采用：
+
+```
+[12, 4, N, 4]    ← N = 成员列表长度（非 cvol_id）
+I4[N]            ← 显式列出该 Part 拥有的全部 cvol_id
+```
+
+实测 `air_domain`：`N=66`，`I4[66]` = `{1,8,9,…,72} \ {2,3,4,7}`。
+
+**修复**：
+
+| 改动 | 说明 |
+|------|------|
+| `_parse_part_cvol_membership()` | 检测 `[12,4,N,4]` + `I4[N]`，返回 `frozenset` |
+| `PartCvolSpec` | `int \| frozenset[int]`；`parse_ls_parts` 返回类型扩展 |
+| `part_cvol_cell_mask()` | 单 id 用 `==`，集合用 `np.isin` |
+| `format_part_cvol_spec()` | CLI/GUI 友好显示 `{1..72 ... n=66}` |
+| `gph2cgns._build_zone_plan` | Part Zone 掩码改用 `part_cvol_cell_mask` |
+
+**配套同步**：
+
+| 文件 | 同步内容 |
+|------|----------|
+| `gph_model.py` | 复合 Part 解析 + 掩码/格式化辅助函数 |
+| `gph2cgns.py` | `PartCvolSpec` 类型、`part_cvol_cell_mask` 导入 |
+| `gphviewer.py` | Part 树节点 / 详情 / 预览用 `part_cvol_cell_mask` |
+| `gph_parser.py` | `format_description()` §10、`partition` 输出格式化 |
+| `tests/test_volume_zone_cells.py` | `-v` 显示 `kind=membership`、union 覆盖校验 |
+| `GPH_FORMAT_SPEC.md` | §5.1 / §5.6.1–5.6.3 复合 Part 布局 |
+| `DEV_SUMMARY.md` | 本节 |
+| `CLAUDE.md` / `AGENTS.md` / `README.md` | 复合 Part 说明与测试命令 |
+
+**验证**（`tests/laptop_simplified_more_regions.gph`）：
+
+| Part | cvol spec | cells |
+|------|-----------|------:|
+| air_domain | 66-id frozenset | 151 375 |
+| outlet11 | 2 | 1 256 |
+| outlet21 | 3 | 1 256 |
+| rotation2 | 4 | 9 491 |
+| rotation1 | 7 | 9 716 |
+
+旧样例 `box_ansa`、`laptop_simplified_voxel_less` 仍 PASS（简单 Part 路径不变）。
 
 ---
 

@@ -29,9 +29,12 @@ except ImportError:
 from gph2cgns import _build_zone_plan, parse_gph_mesh
 from gph_model import (
     _ls_parts_name_blocks,
+    _parse_part_cvol_membership,
     _scan_cvol_descriptor_chain,
     find_section,
+    format_part_cvol_spec,
     open_gph_buffer,
+    part_cvol_cell_mask,
     section_end,
 )
 
@@ -123,7 +126,7 @@ def _explain_zone_source(
     return "fallback: all cells (no part/region name match)"
 
 
-def _part_for_part_zone(zone_name: str, mesh: dict) -> tuple[str, int] | None:
+def _part_for_part_zone(zone_name: str, mesh: dict) -> tuple[str, object] | None:
     """If *zone_name* is a Part-derived zone, return (part_name, cvol_id)."""
     parts_with_cvol: list[tuple[str, int]] = mesh.get("parts_with_cvol", [])
     asm_info = mesh.get("assembly_info", {}) or {}
@@ -148,6 +151,12 @@ def _part_for_part_zone(zone_name: str, mesh: dict) -> tuple[str, int] | None:
         if _zone_name_for_part(part) == zone_name:
             return part, cv
     return None
+
+
+def _flatten_part_cvol_ids(spec: object) -> set[int]:
+    if isinstance(spec, frozenset):
+        return set(spec)
+    return {int(spec)}
 
 
 def print_partition_details(gph_path: Path, mesh: dict) -> None:
@@ -187,30 +196,42 @@ def print_partition_details(gph_path: Path, mesh: dict) -> None:
 
     # LS_Parts raw + resolved
     print("  LS_Parts:")
+    actual_set = set(_cvol_id_histogram(cvol)) if cvol is not None and len(cvol) == n_cells else None
     with open_gph_buffer(str(gph_path)) as data:
-        raw_chains = _ls_parts_raw_chains(data)
-    if not raw_chains and not parts_with_cvol:
+        sec_start = find_section(data, "LS_Parts")
+        sec_end = section_end(data, sec_start) if sec_start >= 0 else 0
+        name_blocks = _ls_parts_name_blocks(data, sec_start, sec_end) if sec_start >= 0 else []
+    if not name_blocks and not parts_with_cvol:
         print("    (none)")
     else:
         resolved = dict(parts_with_cvol)
-        for i, (name, chain) in enumerate(raw_chains, start=1):
-            cv = resolved.get(name)
-            chain_s = chain if chain else "(empty)"
-            if cv is not None and cvol is not None and len(cvol) == n_cells:
-                cells = int((cvol == cv).sum())
-                in_hist = cv in _cvol_id_histogram(cvol)
-                flag = "OK" if cells > 0 and in_hist else "WARN"
-                print(
-                    f"    [{i}] part={name!r}  chain={chain_s}  "
-                    f"-> cvol_id={cv}  cells={cells}  [{flag}]"
-                )
-            else:
-                print(
-                    f"    [{i}] part={name!r}  chain={chain_s}  "
-                    f"-> cvol_id={cv}  cells=(n/a)"
-                )
+        with open_gph_buffer(str(gph_path)) as data:
+            for i, (name, _, after) in enumerate(name_blocks):
+                scan_end = name_blocks[i + 1][1] if i + 1 < len(name_blocks) else sec_end
+                chain = _scan_cvol_descriptor_chain(data, after, scan_end)
+                membership = _parse_part_cvol_membership(data, after, scan_end, actual_set)
+                cv = resolved.get(name)
+                chain_s = chain if chain else "(empty)"
+                kind = "membership" if isinstance(cv, frozenset) else "single"
+                if cv is not None and cvol is not None and len(cvol) == n_cells:
+                    cells = int(part_cvol_cell_mask(cvol, cv).sum())
+                    flag = "OK" if cells > 0 else "WARN"
+                    print(
+                        f"    [{i + 1}] part={name!r}  chain={chain_s}  "
+                        f"kind={kind}  cvol={format_part_cvol_spec(cv)}  "
+                        f"cells={cells}  [{flag}]"
+                    )
+                    if membership is not None:
+                        print(f"         membership I4[{len(membership)}] (N={len(chain) and chain[-1]})")
+                else:
+                    print(
+                        f"    [{i + 1}] part={name!r}  chain={chain_s}  "
+                        f"-> cvol={cv}  cells=(n/a)"
+                    )
 
-    mapped_ids = [cv for _, cv in parts_with_cvol]
+    all_mapped: set[int] = set()
+    for _, cv in parts_with_cvol:
+        all_mapped |= _flatten_part_cvol_ids(cv)
     actual_ids = sorted(_cvol_id_histogram(cvol)) if cvol is not None and len(cvol) == n_cells else []
     print("  LS_Parts <-> cvol_id mapping check:")
     if not parts_with_cvol:
@@ -218,18 +239,16 @@ def print_partition_details(gph_path: Path, mesh: dict) -> None:
     elif not actual_ids:
         print("    cannot validate (cvol array unavailable or wrong length)")
     else:
-        unique_mapped = sorted(set(mapped_ids))
-        print(f"    mapped cvol_ids:   {unique_mapped}")
-        print(f"    actual cvol_ids:   {actual_ids}")
-        if len(mapped_ids) != len(set(mapped_ids)):
-            print("    WARN: duplicate cvol_id among parts")
-        if set(unique_mapped) == set(actual_ids):
-            print("    coverage: OK (bijection with actual set)")
-        elif set(unique_mapped) <= set(actual_ids):
-            print("    coverage: PARTIAL (mapped ids subset of actual, not full cover)")
+        print(f"    union of part cvol ids: {sorted(all_mapped)}  (n={len(all_mapped)})")
+        print(f"    actual cvol_ids:        {actual_ids}  (n={len(actual_ids)})")
+        if all_mapped == set(actual_ids):
+            print("    coverage: OK (parts partition the mesh)")
+        elif all_mapped <= set(actual_ids):
+            missing = sorted(set(actual_ids) - all_mapped)
+            print(f"    coverage: PARTIAL (unassigned cvol_ids: {missing[:12]}{'...' if len(missing)>12 else ''})")
         else:
-            extra = sorted(set(unique_mapped) - set(actual_ids))
-            print(f"    coverage: FAIL (mapped ids not in actual set: {extra})")
+            extra = sorted(all_mapped - set(actual_ids))
+            print(f"    coverage: FAIL (unknown mapped ids: {extra})")
 
     # LS_Assemblies
     print("  LS_Assemblies:")
@@ -257,7 +276,7 @@ def print_partition_details(gph_path: Path, mesh: dict) -> None:
         if zone_name in part_zone_names:
             hit = _part_for_part_zone(zone_name, mesh)
             part, cv = hit if hit else ("?", "?")
-            note = f"part {part!r}, cvol_id={cv}"
+            note = f"part {part!r}, cvol={format_part_cvol_spec(cv)}"
         else:
             note = _explain_zone_source(zone_name, mesh, n_cells, parts_with_cvol)
             # show which cvol_ids contribute when mask is a single-id subset
