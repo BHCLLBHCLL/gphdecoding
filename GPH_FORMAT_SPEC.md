@@ -271,15 +271,22 @@ UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_path
 
 `laptop_simplified_voxel_v6.gph`（~4.9 GiB，conn 两段 ~1.91 GiB）：解析 ~8 分钟。
 
-## 7. 使用 Python 解析
+## 7. 使用 Python 解析与验证
 
-运行：
+解析 GPH 结构：
 
 ```bash
-python gph_parser.py [box.gph]
+python gph_parser.py [file.gph]    # 默认 tests/box_ansa.gph
 ```
 
-将输出节布局、数据采样和完整格式说明。
+对比体区域 Zone cell 数（需 `tests/{name}_orig.cgns` 参考文件）：
+
+```bash
+python tests/test_volume_zone_cells.py          # 简洁对比
+python tests/test_volume_zone_cells.py -v       # 含 LS_Parts 链 / cvol_id 详情
+```
+
+将输出节布局、数据采样和完整格式说明；`-v` 模式便于核对 `LS_Parts` 与 `LS_CvolIdOfElements` 映射是否正确。
 
 ## 8. 参考
 

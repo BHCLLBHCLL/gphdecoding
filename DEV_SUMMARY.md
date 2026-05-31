@@ -886,8 +886,9 @@ if use_sequential and not all(1..N in actual_set):
 | `gphviewer.py` | 所有 `parse_ls_parts` 调用均传入 `cvol_id=` |
 | `GPH_FORMAT_SPEC.md` | §5.6 改写；§5.1 引用更新 |
 | `CLAUDE.md` | Architecture / cvol_id 段落更新 |
+| `tests/test_volume_zone_cells.py` | 新增：遍历 `tests/*.gph`，对比 `{stem}_orig.cgns` 体区域 cell 数；`-v` 输出 LS_Parts 链 / cvol_id 直方图 |
 
-**验证**（仓库内全部 12 个 `.gph` 样例）：
+**验证**（`tests/` 目录 + 仓库根目录 `.gph` 样例）：
 
 | 样例 | actual cvol_ids | 映射结果 |
 |------|-----------------|----------|

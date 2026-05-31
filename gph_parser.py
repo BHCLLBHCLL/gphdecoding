@@ -256,9 +256,19 @@ def format_description() -> str:
 """
 
 
+def _default_sample_gph() -> Path:
+    """Prefer tests/box_ansa.gph, then legacy repo-root names."""
+    root = Path(__file__).resolve().parent
+    for name in ("tests/box_ansa.gph", "box_ansa.gph", "box.gph"):
+        p = root / name
+        if p.is_file():
+            return p
+    return root / "tests" / "box_ansa.gph"
+
+
 def main():
     args = sys.argv[1:]
-    path = Path(args[0]) if args and not args[0].startswith("-") else Path(__file__).parent / "box.gph"
+    path = Path(args[0]) if args and not args[0].startswith("-") else _default_sample_gph()
 
     if not path.exists():
         print(f"Error: file not found: {path}")

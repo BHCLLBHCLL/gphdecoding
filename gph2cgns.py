@@ -1386,10 +1386,19 @@ def write_cgns(mesh: dict, outpath: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _default_sample_gph() -> Path:
+    root = Path(__file__).resolve().parent
+    for name in ("tests/box_ansa.gph", "box_ansa.gph", "box.gph"):
+        p = root / name
+        if p.is_file():
+            return p
+    return root / "tests" / "box_ansa.gph"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert GPH file to CGNS format")
-    parser.add_argument("gph_file", nargs="?", default="box.gph",
-                        help="Input GPH file")
+    parser.add_argument("gph_file", nargs="?", default=None,
+                        help="Input GPH file (default: tests/box_ansa.gph)")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="Output CGNS file (default: input basename with .cgns)")
     parser.add_argument("--single-zone", action="store_true",
@@ -1400,7 +1409,7 @@ def main():
                              "(default: 'FluidRegion').")
     args = parser.parse_args()
 
-    gph_path = Path(args.gph_file)
+    gph_path = Path(args.gph_file) if args.gph_file else _default_sample_gph()
     if not gph_path.exists():
         print(f"Error: file not found: {gph_path}")
         sys.exit(1)

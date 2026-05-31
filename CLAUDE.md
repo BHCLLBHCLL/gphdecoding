@@ -14,7 +14,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Lint | `~/.local/bin/ruff check *.py` |
 | Syntax check | `python3 -m py_compile <file>.py` |
 
-**No test suite exists.** Validate the converter by running it on `box_ansa.gph` and comparing with the reference file `box_ansa_orig.cgns`.
+**Partition test:** `python3 tests/test_volume_zone_cells.py` compares volume-zone cell counts against `tests/*_orig.cgns`. Use `-v` to inspect LS_Parts chains and cvol_id mapping.
+
+For full CGNS output validation, run `gph2cgns.py` on `tests/box_ansa.gph` and compare with `tests/box_ansa_orig.cgns`.
 
 No build step — each script is a standalone entry-point run directly with `python3`.
 
