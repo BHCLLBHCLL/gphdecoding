@@ -14,6 +14,7 @@
 10. [第五阶段：多 Zone 分区、多面体网格与命名 BC](#10-第五阶段多-zone-分区多面体网格与命名-bc)
 11. [第六阶段：超大 GPH（conn 分块 + mmap）](#11-第六阶段超大-gphconn-分块--mmap)
 12. [后续方向：Zone/BC 命名去硬编码](#12-后续方向zonebc-命名去硬编码)
+13. [当前代码功能综述](#13-当前代码功能综述)
 
 ---
 
@@ -1065,3 +1066,30 @@ I4[N]            ← 显式列出该 Part 拥有的全部 cvol_id
 - [ ] `_classify_zone_cells` 无法匹配时 CLI 有明确 warning，且不 silently 全网格（除 `FluidRegion` 等白名单 Zone）；
 - [ ] 现有参考样本（box_ansa、tr03、laptop_v4/v6）Zone/BC **名称**与 `*_orig.cgns` 仍 byte-level 或列表级一致；
 - [ ] 命名策略可通过配置文件切换，无需改 `gph2cgns.py` 核心逻辑。
+
+---
+
+## 13. 当前代码功能综述
+
+> 目标:把 Software Cradle scFLOW / SCTpre 的 **GPH** 二进制网格文件(CRDL-FLD 大端格式)逆向解析并转换为 **CGNS/HDF5** 非结构化网格(NGON_n / NFACE_n),布局对齐官方 `FLDUTIL` 导出器。
+
+### 13.1 模块分工
+
+| 文件 | 角色 |
+|------|------|
+| **`gph_model.py`** | 共享解析库。字节序读取(标准 BE float64 + 词序反转)、段定位(`find_section`)、数据块扫描(`iter_data_blocks`)、`LS_Links` / `LS_Parts` / `LS_Nodes` / `LS_SurfaceRegions` / `LS_Assemblies` 解析、`part_cvol_cell_mask`、可编辑树模型 `GphNode` / `GphDocument`(>512 MiB 自动 mmap)、`build_mesh_preview` 用于交互预览。|
+| **`gph_parser.py`** | CLI 检视器:动态扫描所有命名段,输出 section 布局、网格拓扑摘要、partition 元数据、cvol 集合,以及完整格式说明字符串。|
+| **`gph2cgns.py`** | 核心转换器。`_parse_ls_nodes` 自动检测 BE / 词序反转编码;`_parse_ls_links` 处理 owner / neighbour / npe + conn(支持 >1 GiB 1 GiB 分片延续);`_extract_zone_submesh` 为每个 zone 抽取子网格并重编号(法向反向时反转节点顺序);`_write_ngon` / `_write_nface` / `_write_zone_bc` 写 CGNS,HDF5 v0 超级块 + 紧凑组(`track_order=False`)以兼容 ANSA。Zone 计划由 `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies`(含 `root_empty_prefix` 启发式)驱动,空元数据时回退到 `FluidRegion` + `FPHPARTS.box_vol`。|
+| **`gphviewer.py`** | PyQt6 / 5 GUI(类似 HDFView):树视图 + 十六进制 / 表格 + 多边形 3D 预览,支持 zone / face 选择高亮。|
+| **`tests/test_volume_zone_cells.py`** | 回归测试:对照 `*_orig.cgns` 验证每个 zone 的 cell 数(`-v` 输出 LS_Parts 链、cvol_id 直方图)。|
+
+### 13.2 关键设计点
+
+- **大文件友好**:文件 >512 MiB 走 `mmap`;>~1 GiB 的 `conn` 自动续接,支持标准 `[12,bc][payload][bc]` 与裸 `[I4=bc][payload]` 1 GiB 块混合出现(见 `gph_model._read_conn_continuations`)。
+- **复合 Part**:`air_domain` 这类背景流体使用 `[12,4,N,4] + I4[N]` 成员列表,`PartCvolSpec = int | frozenset[int]`(其中 `N` 是后续成员列表的长度,不是 cvol_id)。
+- **编码方言自动识别**:legacy GPH 词序反转 float64(列序 X,Z,Y),新文件标准 BE,`_score_coord_axes` 启发式按"坐标量级是否物理合理"打分,低分胜出。
+- **CGNS / ANSA 兼容**:HDF5 v0 超级块 + `libver=("earliest", "v108")` + 标准 4 属性(flags / label / name / type);ZoneBC 完整 BC 家族(空 PointList 也保留 group,与 `tr03_orig.cgns` 字节级匹配)。
+- **Vertex 重编号**:首次出现的面节点重排,顺序对齐 FLDUTIL 导出器;被使用过的节点先排,从未引用的尾追。
+- **Zone 抽取**:`_extract_zone_submesh` 复用 `link_data` 结构,跨 zone 边界的 face 自动翻转为新边界(以 zone 内 cell 为 owner,必要时反转节点序保持法向朝外)。
+- **树模型**:`GphNode` / `GphDocument` 支持 `apply_patch` + `save`(非 mmap 模式下可字节级编辑回写),为 GUI 编辑器提供底层支撑。
+- **Zone 命名启发式**:根据 `LS_Assemblies` 推导每个 Part 的完整路径(`part_paths`);根级 Part 在有空 assembly 序列时使用 `root_empty_prefix`(laptop 的 `fan2.fan1`);路径深度 `< 2` 时前加 `FPHPARTS.`,否则直接用 raw path。
