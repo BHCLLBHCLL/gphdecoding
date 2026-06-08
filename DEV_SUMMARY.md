@@ -788,6 +788,22 @@ conn     : 513041554 entries in 2 chunks
 
 解析 ~8 min。
 
+### 11.13 末段 conn 双头续接（box / voxel v9 面翘曲）
+
+**现象**：`tests/box.gph`、`tests/laptop_simplified_voxel_v9.gph` 转换后体网格在 1 GiB conn 边界处出现面错位/不封闭（`box_error1.png`、`laptop_error1.png`）。`conn_got == sum(npe)` 且 `conn_complete=True`，故易被误判为分区或坐标问题。
+
+**根因**：三段 conn 的**末段**裸续接格式为 ``[I4=1073741824][I4=need_bytes][payload]``（重复 1 GiB 标记 + 实际 payload 字节数）。旧版 `_read_conn_continuations` 在 ``bare_bc == 1 GiB`` 且 ``need_bytes < 1 GiB`` 时从 ``pos+4`` 读 payload，把 ``need_bytes`` 误当作第一个顶点索引写入 conn（如 box 在 entry 536870912 处出现 ``173846272``）。
+
+**修复**：若 ``read_i32_be(pos+4) == need_bytes``，payload 从 ``pos+8`` 起读；两段 conn（v4/v6）的单头 ``[I4=bcN][payload]`` 路径不变。
+
+**验证**：
+
+| 文件 | 修复前 bad index | 修复后 max index |
+|------|------------------|------------------|
+| `tests/box.gph` | `173846272`（= 末段字节数） | `48627124`（= n_vertices−1） |
+| `tests/laptop_simplified_voxel_v9.gph` | `713679784` | `66960602` |
+| `tests/laptop_simplified_voxel_v4.gph` | （无） | `33723175` |
+
 ### 11.9 LS_Parts cvol_id 扫描首值 sanity check（#14）
 
 > **状态**：已被 §11.11 取代；以下保留作历史记录。

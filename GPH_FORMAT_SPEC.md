@@ -126,8 +126,10 @@ CSR 索引：`face_offsets[0]=0`，`face_offsets[i+1]=face_offsets[i]+npe[i]`；
 [12, bc1][conn 第 1 段 payload][bc1]   ← 标准块（bc1 常为 1073741824）
 [I4=1073741824][conn 第 2 段 raw...]  ← 裸 byte_count + 数据，无 [I4=12] 头
 ... 可重复多个完整 1 GiB 裸块 ...
-[I4=bcN][conn 末段 raw...]             ← 末段；bcN 可能仍为 1 GiB 标记但 payload 更短
+[I4=1073741824][I4=bcN][conn 末段 raw...]  ← 末段：重复 1 GiB 标记 + 实际 payload 字节数 + 数据
 ```
+
+两段 conn（如 `laptop_simplified_voxel_v4.gph`）的续接块为单头裸块 ``[I4=bcN][payload]``（``bcN ==`` 剩余字节数）。**三段及以上**时，末段使用双头格式（见上行）；若误将 ``bcN`` 当作首个顶点索引读入，会在第二段 1 GiB 边界出现单点索引等于末段字节数（如 ``tests/box.gph`` 的 ``173846272``），导致面翘曲。
 
 **conn 块选择**：若无块字节数恰好等于 `sum(npe)×4`，取除 owner/neighbor/npe 三数组外 **byte_count 最大且 ≥ 12** 的 I4 块（勿用 `3×n_faces×4` 作下界——多面体网格首段 conn 常被 cap 在 1 GiB）。
 

@@ -99,8 +99,10 @@ def _read_conn_continuations(data, pos: int, sec_end: int, got: int,
 
     Very large meshes cap each conn payload at 1 GiB.  Continuation blocks use
     bare ``[I4=byte_count][payload]`` (no ``[I4=12]`` header).  Multiple full
-    1 GiB chunks may appear; the final chunk may repeat the 1 GiB marker with
-    a shorter payload (e.g. ``laptop_simplified_denser_v2_gph.gph``).
+    1 GiB chunks may appear; the final short chunk repeats the 1 GiB marker
+    followed by the actual payload byte count and then the payload:
+    ``[I4=1GiB][I4=need_bytes][payload]`` (e.g. ``tests/box.gph``,
+    ``laptop_simplified_denser_v2_gph.gph``).
 
     Returns ``(new_got, final_pos, n_continuation_chunks)``.
     """
@@ -122,6 +124,22 @@ def _read_conn_continuations(data, pos: int, sec_end: int, got: int,
             continue
 
         if (bare_bc == _CONN_CHUNK_BYTES
+                and need_bytes < _CONN_CHUNK_BYTES
+                and pos + 8 <= sec_end):
+            inner_bc = read_i32_be(data, pos + 4)
+            if (inner_bc == need_bytes
+                    and pos + 8 + need_bytes <= sec_end):
+                n = need_bytes // 4
+                if conn_parts is not None:
+                    conn_parts.append(
+                        np.frombuffer(data, dtype=">u4", count=n, offset=pos + 8)
+                        .astype(np.int64).copy())
+                got += n
+                pos += 8 + need_bytes
+                n_continuations += 1
+                break
+
+        if (bare_bc == _CONN_CHUNK_BYTES
                 and pos + 4 + need_bytes <= sec_end):
             n = need_bytes // 4
             if conn_parts is not None:
@@ -129,6 +147,7 @@ def _read_conn_continuations(data, pos: int, sec_end: int, got: int,
                     np.frombuffer(data, dtype=">u4", count=n, offset=pos + 4)
                     .astype(np.int64).copy())
             got += n
+            pos += 4 + need_bytes
             n_continuations += 1
             break
 
