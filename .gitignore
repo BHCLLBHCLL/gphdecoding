@@ -11,3 +11,5 @@ box.cgns
 *.swp
 *.swo
 .DS_Store
+
+tests/*
