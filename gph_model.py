@@ -411,10 +411,17 @@ def parse_ls_links_summary(data: bytes) -> Optional[dict]:
 def _ls_parts_name_blocks(
     data: bytes, sec_start: int, sec_end: int,
 ) -> list[tuple[str, int, int]]:
-    """Return ``[(name, name_header_pos, after_trailer_pos), ...]`` in file order."""
+    """Return ``[(name, name_header_pos, after_trailer_pos), ...]`` in file order.
+
+    Name blocks are ASCII (NUL/space-padded) data blocks containing at least
+    one alphabetic character.  GPH files pad names to 255 bytes; FPH files
+    use a smaller padding (e.g. 23 bytes).  The block size is therefore not
+    hard-coded — the printable-ASCII + alpha heuristic is sufficient to
+    distinguish name blocks from the surrounding cvol-descriptor metadata.
+    """
     name_blocks: list[tuple[str, int, int]] = []
     for p, bc in iter_data_blocks(data, sec_start, sec_end):
-        if bc != 255:
+        if bc <= 0 or bc > 512:
             continue
         raw = data[p : p + bc]
         if not all(b == 0 or 32 <= b < 127 for b in raw):
@@ -497,14 +504,16 @@ def _resolve_single_part_cvol(
     chain: list[int],
     actual_set: Optional[set[int]],
 ) -> int:
-    """Map a simple ``[1, cvol_id]`` descriptor chain to one cvol_id."""
+    """Map a simple ``[1, cvol_id]`` descriptor chain to one cvol_id.
+
+    The chain is ``[1, <cvol_id>]`` — a leading ``1`` marker followed by
+    the part's cvol_id.  The last value is therefore always the cvol_id.
+    It is returned even when it is absent from *actual_set* (the part
+    simply has 0 cells in this mesh); falling back to an earlier chain
+    value would incorrectly alias the part to another region's cells.
+    """
     if not chain:
         return 1
-    if actual_set:
-        for value in reversed(chain):
-            iv = int(value)
-            if iv in actual_set:
-                return iv
     return int(chain[-1])
 
 

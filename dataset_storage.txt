@@ -1,0 +1,47 @@
+
+=== tests/tr03_9_converted2.cgns ===
+Zone: Case[2]
+  CoordinateX: shape=(221786,) dtype=float64 chunks=None compression=None maxshape=(221786,)
+  CoordinateY: shape=(221786,) dtype=float64 chunks=None compression=None maxshape=(221786,)
+  CoordinateZ: shape=(221786,) dtype=float64 chunks=None compression=None maxshape=(221786,)
+  Case[2]/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  GridElements_Faces/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  FlowSolution/EVIS/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/GridLocation/ data: shape=(10,) dtype=int8 chunks=None compression=None
+  FlowSolution/LNAM_RV001X/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/LNAM_RV001Y/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/LNAM_RV001Z/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/PRES/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/TEPS/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/TPRS/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/TURK/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/VELX/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/VELY/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+  FlowSolution/VELZ/ data: shape=(63697,) dtype=float64 chunks=None compression=None
+
+=== tests/box_ansa_orig.cgns ===
+Zone: FPHPARTS.box_vol
+  CoordinateX: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  CoordinateY: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  CoordinateZ: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  GridElements_Faces/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  FPHPARTS.box_vol/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  FlowSolution/GridLocation/ data: shape=(10,) dtype=int8 chunks=None compression=None
+
+=== tr03_orig.cgns ===
+Zone: @VPartRegion_Case[2]
+  CoordinateX: shape=(70877,) dtype=float64 chunks=None compression=None maxshape=(70877,)
+  CoordinateY: shape=(70877,) dtype=float64 chunks=None compression=None maxshape=(70877,)
+  CoordinateZ: shape=(70877,) dtype=float64 chunks=None compression=None maxshape=(70877,)
+  GridElements_Faces/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  @VPartRegion_Case[2]/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  FlowSolution/GridLocation/ data: shape=(10,) dtype=int8 chunks=None compression=None
+
+=== tests/box_ansa_fph_test.cgns ===
+Zone: FPHPARTS.box_vol
+  CoordinateX: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  CoordinateY: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  CoordinateZ: shape=(8,) dtype=float64 chunks=None compression=None maxshape=(8,)
+  FPHPARTS.box_vol/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  GridElements_Faces/ data: shape=(2,) dtype=int32 chunks=None compression=None
+  FlowSolution/GridLocation/ data: shape=(10,) dtype=int8 chunks=None compression=None
