@@ -814,26 +814,22 @@ def parse_gph_mesh(filepath: str) -> dict:
 #
 # CGNS files exported by Software Cradle's ``FLDUTIL`` tool (see the
 # reference file ``box_ansa_orig.cgns``) use the **v0 superblock** with
-# v1 object headers carrying HDF5 1.8 "Link Info" / "Group Info" messages.
-# Some third-party CGNS readers — including ANSA — only accept v0/v1
-# superblocks and reject the newer v2 superblock (HDF5 1.8 file format)
-# with a "No bases found!" error.
+# v1 object headers carrying HDF5 1.8 "Link Info" / "Group Info" messages
+# (new-style group format with link creation-order tracking).
 #
-# We therefore open the file with ``libver=("earliest", "v108")`` (h5py's
-# default), which writes a **v0 superblock** with the legacy v1.6 group
-# storage (symbol-table + B-tree + local-heap triple).  This is universally
-# readable by every CGNS toolkit ever released, at the cost of roughly
-# 1 KB of metadata per group (the resulting box_ansa.cgns is ~73 KB vs the
-# 35 KB FLDUTIL reference; the *content* of every group/dataset/attribute
-# remains a byte-perfect PERFECT MATCH against the reference).
+# We open the file with ``libver=("earliest", "v108")`` and
+# ``track_order=True``.  The ``track_order=True`` flag is **critical**:
+# without it, h5py creates old-style groups (Symbol Table only) with
+# ``cache_type=1`` in the superblock.  This produces a malformed root
+# object header (claims N messages but only has space for 1) that
+# ParaView's vtkCGNSReader / vtkIOSSReader cannot parse, resulting in a
+# "bad object header version number" / "Unable to open CGNS database for
+# read access" error.
 #
-# The smaller v2-superblock layout that the FLDUTIL exporter achieves
-# (35 KB) requires HDF5's "new" group format with v0 superblock and Link
-# Info messages, which is controlled by ``H5Pset_link_phase_change`` *plus*
-# internal flags that the h5py Python binding does not expose.  Falling
-# back to v2-only superblock via ``libver=("v108", "v108")`` shrinks the
-# file to 31 KB but produces a v2-superblock file that ANSA refuses to
-# read — hence the choice below.
+# With ``track_order=True``, h5py creates new-style groups (Link Info +
+# Group Info messages) with ``cache_type=0``, matching the FLDUTIL
+# reference format.  ParaView, ANSA, and the official CGNS C/C++ libraries
+# all read this format correctly.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -842,15 +838,20 @@ _MAX_CHILDREN_PER_GROUP = 7  # Zone_t children: data, ZoneType, GridCoordinates,
 
 
 def _create_compact_group(parent, name: str):
-    """Create an HDF5 group under *parent* with ANSA-compatible storage.
+    """Create an HDF5 group under *parent* with ParaView-compatible storage.
 
-    ``track_order=False`` suppresses the HDF5 1.8 attribute-creation-order
-    index (the FLDUTIL reference does not write it either).  Combined with
-    the v0-superblock file format selected in :func:`write_cgns`, the
-    resulting layout is read correctly by every CGNS toolkit including
-    ANSA and the official CGNS C/C++ libraries.
+    ``track_order=True`` enables HDF5 1.8 link creation-order tracking, which
+    forces the **new-style group format** (Link Info + Group Info messages in
+    the object header).  This is critical for ParaView's vtkCGNSReader /
+    vtkIOSSReader: the default old-style group format (Symbol Table only)
+    writes a malformed root object header that ParaView cannot parse
+    ("bad object header version number").
+
+    The FLDUTIL reference file also uses new-style groups with link creation
+    order tracking (Link Info flags=0x03), confirming this is the correct
+    format for CGNS files.
     """
-    return parent.create_group(name, track_order=False)
+    return parent.create_group(name, track_order=True)
 
 
 def _set_cgns_attrs(grp, name: str, label: str, type_str: str) -> None:
@@ -1327,13 +1328,16 @@ def write_cgns(mesh: dict, outpath: str,
 
     zone_plan = _build_zone_plan(mesh, override_zone_names=zone_names)
 
-    # Use ``libver=("earliest", "v108")`` (h5py's default) to write a
-    # **v0 superblock** file.  Some CGNS readers — notably ANSA — refuse
-    # to open v2-superblock files (HDF5 1.8 file format) with a
-    # "No bases found!" error, so we deliberately stay on the older,
-    # universally-readable file format here.  See the module-level
-    # comment above ``_create_compact_group`` for full rationale.
-    with h5py.File(outpath, "w", libver=("earliest", "v108")) as f:
+    # Use ``libver=("earliest", "v108")`` to write a **v0 superblock** file
+    # with ``track_order=True`` to force new-style group format (Link Info
+    # messages).  This is critical: without ``track_order=True``, h5py creates
+    # old-style groups (Symbol Table only) with ``cache_type=1`` in the
+    # superblock, which produces a malformed root object header that ParaView's
+    # vtkCGNSReader / vtkIOSSReader cannot parse ("bad object header version
+    # number").  The FLDUTIL reference file also uses new-style groups with
+    # link creation order tracking.
+    with h5py.File(outpath, "w", libver=("earliest", "v108"),
+                   track_order=True) as f:
         # ── Root-node attributes (HDF5 MotherNode marker) ────────────────────
         f.attrs.create("label", np.bytes_("Root Node of HDF5 File"),
                        dtype=h5py.string_dtype(length=33))
