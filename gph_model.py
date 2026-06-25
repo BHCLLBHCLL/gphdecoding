@@ -760,18 +760,64 @@ def classify_volume_region_cells(
 
 
 def _score_coord_axes(axes: list["np.ndarray"]) -> float:
+    """Lower score = more plausible CFD vertex coordinate axes.
+
+    Penalises non-finite values, coordinate magnitudes outside ~[1e-30, 1e6],
+    a high fraction of such outliers (typical of wrong float32/float64 decode),
+    and grossly mismatched axis scales.
+    """
     score = 0.0
+    axis_absmax: list[float] = []
     for ax in axes:
-        finite = np.isfinite(ax)
+        arr = np.asarray(ax, dtype=np.float64)
+        finite = np.isfinite(arr)
         if not finite.all():
             score += 1e30
             continue
-        absmax = float(np.max(np.abs(ax))) if ax.size else 0.0
+        absv = np.abs(arr[finite])
+        if absv.size == 0:
+            axis_absmax.append(0.0)
+            continue
+        absmax = float(np.max(absv))
+        axis_absmax.append(absmax)
         if absmax > 1e6 or (absmax < 1e-30 and absmax != 0.0):
             score += absmax + (1.0 / max(absmax, 1e-300))
         else:
             score += absmax
+        bad_frac = float(
+            ((absv > 1e6) | ((absv < 1e-30) & (absv != 0.0))).mean()
+        )
+        if bad_frac > 0.01:
+            score += 1e20 * bad_frac
+    pos = [v for v in axis_absmax if v > 0]
+    if len(pos) >= 2:
+        ratio = max(pos) / min(pos)
+        if ratio > 1e6:
+            score += ratio
     return score
+
+
+def ls_nodes_descriptor_elem_bytes(
+    data, sec_start: int, sec_end: int,
+) -> Optional[int]:
+    """Return element size (4=float32, 8=float64) from LS_Nodes type descriptors."""
+    counts = {4: 0, 8: 0}
+    pos = sec_start + 40
+    n = len(data)
+    while pos + 16 <= sec_end and pos + 16 <= n:
+        if read_i32_be(data, pos) == 12:
+            tc = read_i32_be(data, pos + 4)
+            if tc in (4, 8):
+                dim0 = read_i32_be(data, pos + 8)
+                dim1 = read_i32_be(data, pos + 12)
+                if 0 < dim0 < 10_000_000 and 0 < dim1 < 10_000_000:
+                    counts[tc] += 1
+        pos += 4
+    if counts[8] > counts[4]:
+        return 8
+    if counts[4] > counts[8]:
+        return 4
+    return None
 
 
 def _ls_nodes_coordinate_layout(data) -> Optional[dict]:

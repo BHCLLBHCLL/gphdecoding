@@ -28,8 +28,14 @@ from typing import Optional
 import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
+from gph_model import _score_coord_axes
+from gph_model import ls_nodes_descriptor_elem_bytes
 from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
 from gph_model import part_cvol_cell_mask, PartCvolSpec
+
+_COORD_SCORE_SAMPLE = 256
+_ELEM_PRIOR_MISMATCH = 1e15
+_F32_ON_F64_ALIGNED_PRIOR = 10.0
 
 try:
     import h5py
@@ -190,8 +196,9 @@ def _parse_ls_nodes(data: bytes):
        (legacy ``box.gph`` files).
     3. Big-endian float32 (FPH files with solver results, e.g. ``tr03_9.fph``).
 
-    The dialect is auto-detected by trying all readings and picking the one
-    whose magnitudes are physically plausible coordinate values.
+    Dialect auto-detection scores a small sample of each plausible decoding
+    (``gph_model._score_coord_axes``), applies ``[12,4|8,…]`` descriptor priors,
+    and only then decodes the full axis arrays.
     """
     sec_start = _find_section(data, "LS_Nodes")
     if sec_start < 0:
@@ -199,66 +206,64 @@ def _parse_ls_nodes(data: bytes):
     sec_end = _section_end(data, sec_start)
 
     blocks = list(_iter_data_blocks(data, sec_start, sec_end))
-    # Keep only blocks whose byte count is a positive multiple of 4 (float32 or
-    # float64 arrays).  The three biggest such blocks of identical size are the
-    # X/Y/Z coordinate blocks.
     f_blocks = [(p, bc) for p, bc in blocks if bc >= 4 and bc % 4 == 0]
     if len(f_blocks) < 3:
         return None, 0
 
-    # Pick the first three blocks that share the largest common size — that is
-    # the X/Y/Z trio.
     sizes = [bc for _, bc in f_blocks]
     target = max(set(sizes), key=sizes.count)
     trio = [(p, bc) for p, bc in f_blocks if bc == target][:3]
     if len(trio) < 3:
         return None, 0
 
-    def _score(axes):
-        """Lower score = more plausible coordinate magnitudes."""
-        score = 0.0
-        for ax in axes:
-            finite = np.isfinite(ax)
-            if not finite.all():
-                score += 1e30
-                continue
-            absmax = np.max(np.abs(ax)) if ax.size else 0.0
-            if absmax > 1e6 or absmax < 1e-6 and absmax != 0.0:
-                score += absmax + (1.0 / max(absmax, 1e-300))
-            else:
-                score += absmax
-        return score
+    bc = trio[0][1]
+    elem_hint = ls_nodes_descriptor_elem_bytes(data, sec_start, sec_end)
 
-    # Candidate decodings: (axes_list, n_vertices, is_word_reversed)
-    candidates = []
+    def _ranked_score(sample_axes: list[np.ndarray], elem_bytes: int) -> float:
+        s = _score_coord_axes(sample_axes)
+        if elem_hint is not None and elem_bytes != elem_hint:
+            s += _ELEM_PRIOR_MISMATCH
+        elif elem_hint is None and elem_bytes == 4 and bc % 8 == 0:
+            s += _F32_ON_F64_ALIGNED_PRIOR
+        return s
 
-    # Float64 big-endian
-    n_f64 = trio[0][1] // 8
-    if n_f64 > 0:
-        axes_be = [_f64_be_array(data, p, n_f64) for p, _ in trio]
-        candidates.append((axes_be, n_f64, False))
+    # (score, full_decode_kind) where kind is "be" | "wr" | "f32"
+    ranked: list[tuple[float, str]] = []
 
-    # Float64 word-reversed
-    if n_f64 > 0:
-        axes_wr = [_f64_wr_array(data, p, n_f64) for p, _ in trio]
-        candidates.append((axes_wr, n_f64, True))
+    if bc % 8 == 0:
+        n_f64 = bc // 8
+        n_sample = min(n_f64, _COORD_SCORE_SAMPLE)
+        sample_be = [_f64_be_array(data, p, n_sample) for p, _ in trio]
+        ranked.append((_ranked_score(sample_be, 8), "be"))
+        sample_wr = [_f64_wr_array(data, p, n_sample) for p, _ in trio]
+        ranked.append((_ranked_score(sample_wr, 8), "wr"))
 
-    # Float32 big-endian
-    n_f32 = trio[0][1] // 4
-    if n_f32 > 0:
-        axes_f32 = [_f32_be_array(data, p, n_f32) for p, _ in trio]
-        candidates.append((axes_f32, n_f32, False))
+    allow_f32 = not (elem_hint == 8 and bc % 8 == 0)
+    if bc % 4 == 0 and allow_f32:
+        n_f32 = bc // 4
+        n_sample = min(n_f32, _COORD_SCORE_SAMPLE)
+        sample_f32 = [_f32_be_array(data, p, n_sample) for p, _ in trio]
+        ranked.append((_ranked_score(sample_f32, 4), "f32"))
 
-    if not candidates:
+    if not ranked:
         return None, 0
 
-    # Pick the decoding with the most plausible coordinate magnitudes.
-    best = min(candidates, key=lambda c: _score(c[0]))
-    axes, n_vertices, is_wr = best
-    xyz = np.column_stack(axes)  # file order = (X, Y, Z) for box_ansa / (X, Z, Y) for box
+    _, kind = min(ranked, key=lambda item: item[0])
+    if kind == "be":
+        n_vertices = bc // 8
+        axes = [_f64_be_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = False
+    elif kind == "wr":
+        n_vertices = bc // 8
+        axes = [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = True
+    else:
+        n_vertices = bc // 4
+        axes = [_f32_be_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = False
 
-    # For legacy word-reversed files we keep historic (X, Z, Y) swap behaviour
-    # only when word-reversed encoding was selected.
+    xyz = np.column_stack(axes)
+
     if is_wr:
         xyz = xyz[:, [0, 2, 1]]
 

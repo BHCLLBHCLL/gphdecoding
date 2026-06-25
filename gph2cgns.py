@@ -20,8 +20,11 @@ from typing import Optional
 import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
+from gph_model import _score_coord_axes
 from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
 from gph_model import part_cvol_cell_mask, PartCvolSpec
+
+_COORD_SCORE_SAMPLE = 256
 
 try:
     import h5py
@@ -201,36 +204,21 @@ def _parse_ls_nodes(data: bytes):
         return None, 0
 
     n_vertices = trio[0][1] // 8
+    n_sample = min(n_vertices, _COORD_SCORE_SAMPLE)
 
-    def _decode(reader):
-        if reader is read_f64_be:
-            return [_f64_be_array(data, p, n_vertices) for p, _ in trio]
-        return [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
+    sample_be = [_f64_be_array(data, p, n_sample) for p, _ in trio]
+    sample_wr = [_f64_wr_array(data, p, n_sample) for p, _ in trio]
+    use_be = _score_coord_axes(sample_be) <= _score_coord_axes(sample_wr)
 
-    axes_be = _decode(read_f64_be)
-    axes_wr = _decode(read_f64_wr)
-
-    def _score(axes):
-        """Lower score = more plausible coordinate magnitudes."""
-        score = 0.0
-        for ax in axes:
-            finite = np.isfinite(ax)
-            if not finite.all():
-                score += 1e30
-                continue
-            absmax = np.max(np.abs(ax)) if ax.size else 0.0
-            if absmax > 1e6 or absmax < 1e-30 and absmax != 0.0:
-                score += absmax + (1.0 / max(absmax, 1e-300))
-            else:
-                score += absmax
-        return score
-
-    axes = axes_be if _score(axes_be) <= _score(axes_wr) else axes_wr
+    if use_be:
+        axes = [_f64_be_array(data, p, n_vertices) for p, _ in trio]
+    else:
+        axes = [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
     xyz = np.column_stack(axes)  # file order = (X, Y, Z) for box_ansa / (X, Z, Y) for box
 
     # For legacy word-reversed files we keep historic (X, Z, Y) swap behaviour
     # only when word-reversed encoding was selected.
-    if axes is axes_wr:
+    if not use_be:
         xyz = xyz[:, [0, 2, 1]]
 
     return xyz, n_vertices
