@@ -20,11 +20,9 @@ from typing import Optional
 import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
-from gph_model import _score_coord_axes
+from gph_model import parse_ls_nodes_xyz
 from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
 from gph_model import part_cvol_cell_mask, PartCvolSpec
-
-_COORD_SCORE_SAMPLE = 256
 
 try:
     import h5py
@@ -170,58 +168,8 @@ def _f64_wr_array(buf, offset: int, count: int) -> np.ndarray:
 
 
 def _parse_ls_nodes(data: bytes):
-    """Parse the LS_Nodes section.
-
-    The section contains three coordinate blocks (X, Y, Z file order).  Two
-    on-disk encodings have been observed in the wild:
-
-    1. Standard big-endian float64 (modern files such as ``box_ansa.gph``).
-    2. Word-reversed float64 — each 8-byte double stored as ``[low32_BE][high32_BE]``
-       (legacy ``box.gph`` files).
-
-    The dialect is auto-detected by trying both readings and picking the one
-    whose magnitudes are physically plausible coordinate values.
-    """
-    sec_start = _find_section(data, "LS_Nodes")
-    if sec_start < 0:
-        return None, 0
-    sec_end = _section_end(data, sec_start)
-
-    blocks = list(_iter_data_blocks(data, sec_start, sec_end))
-    # Keep only blocks whose byte count is a positive multiple of 8 (float64
-    # arrays).  The three biggest such blocks of identical size are the X/Y/Z
-    # coordinate blocks.
-    f64_blocks = [(p, bc) for p, bc in blocks if bc >= 8 and bc % 8 == 0]
-    if len(f64_blocks) < 3:
-        return None, 0
-
-    # Pick the first three blocks that share the largest common size — that is
-    # the X/Y/Z trio.
-    sizes = [bc for _, bc in f64_blocks]
-    target = max(set(sizes), key=sizes.count)
-    trio = [(p, bc) for p, bc in f64_blocks if bc == target][:3]
-    if len(trio) < 3:
-        return None, 0
-
-    n_vertices = trio[0][1] // 8
-    n_sample = min(n_vertices, _COORD_SCORE_SAMPLE)
-
-    sample_be = [_f64_be_array(data, p, n_sample) for p, _ in trio]
-    sample_wr = [_f64_wr_array(data, p, n_sample) for p, _ in trio]
-    use_be = _score_coord_axes(sample_be) <= _score_coord_axes(sample_wr)
-
-    if use_be:
-        axes = [_f64_be_array(data, p, n_vertices) for p, _ in trio]
-    else:
-        axes = [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
-    xyz = np.column_stack(axes)  # file order = (X, Y, Z) for box_ansa / (X, Z, Y) for box
-
-    # For legacy word-reversed files we keep historic (X, Z, Y) swap behaviour
-    # only when word-reversed encoding was selected.
-    if not use_be:
-        xyz = xyz[:, [0, 2, 1]]
-
-    return xyz, n_vertices
+    """Parse LS_Nodes (float32 / float64 / word-reversed float64)."""
+    return parse_ls_nodes_xyz(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -28,14 +28,9 @@ from typing import Optional
 import numpy as np
 
 from gph_model import _read_conn_continuations  # returns (got, pos, n_continuations)
-from gph_model import _score_coord_axes
-from gph_model import ls_nodes_descriptor_elem_bytes
+from gph_model import parse_ls_nodes_xyz
 from gph_model import parse_ls_parts as _parse_ls_parts_with_cvol_ids  # canonical LS_Parts cvol_id mapping
 from gph_model import part_cvol_cell_mask, PartCvolSpec
-
-_COORD_SCORE_SAMPLE = 256
-_ELEM_PRIOR_MISMATCH = 1e15
-_F32_ON_F64_ALIGNED_PRIOR = 10.0
 
 try:
     import h5py
@@ -186,88 +181,8 @@ def _f32_be_array(buf, offset: int, count: int) -> np.ndarray:
 
 
 def _parse_ls_nodes(data: bytes):
-    """Parse the LS_Nodes section.
-
-    The section contains three coordinate blocks (X, Y, Z file order).  Three
-    on-disk encodings have been observed in the wild:
-
-    1. Standard big-endian float64 (modern GPH files such as ``box_ansa.gph``).
-    2. Word-reversed float64 — each 8-byte double stored as ``[low32_BE][high32_BE]``
-       (legacy ``box.gph`` files).
-    3. Big-endian float32 (FPH files with solver results, e.g. ``tr03_9.fph``).
-
-    Dialect auto-detection scores a small sample of each plausible decoding
-    (``gph_model._score_coord_axes``), applies ``[12,4|8,…]`` descriptor priors,
-    and only then decodes the full axis arrays.
-    """
-    sec_start = _find_section(data, "LS_Nodes")
-    if sec_start < 0:
-        return None, 0
-    sec_end = _section_end(data, sec_start)
-
-    blocks = list(_iter_data_blocks(data, sec_start, sec_end))
-    f_blocks = [(p, bc) for p, bc in blocks if bc >= 4 and bc % 4 == 0]
-    if len(f_blocks) < 3:
-        return None, 0
-
-    sizes = [bc for _, bc in f_blocks]
-    target = max(set(sizes), key=sizes.count)
-    trio = [(p, bc) for p, bc in f_blocks if bc == target][:3]
-    if len(trio) < 3:
-        return None, 0
-
-    bc = trio[0][1]
-    elem_hint = ls_nodes_descriptor_elem_bytes(data, sec_start, sec_end)
-
-    def _ranked_score(sample_axes: list[np.ndarray], elem_bytes: int) -> float:
-        s = _score_coord_axes(sample_axes)
-        if elem_hint is not None and elem_bytes != elem_hint:
-            s += _ELEM_PRIOR_MISMATCH
-        elif elem_hint is None and elem_bytes == 4 and bc % 8 == 0:
-            s += _F32_ON_F64_ALIGNED_PRIOR
-        return s
-
-    # (score, full_decode_kind) where kind is "be" | "wr" | "f32"
-    ranked: list[tuple[float, str]] = []
-
-    if bc % 8 == 0:
-        n_f64 = bc // 8
-        n_sample = min(n_f64, _COORD_SCORE_SAMPLE)
-        sample_be = [_f64_be_array(data, p, n_sample) for p, _ in trio]
-        ranked.append((_ranked_score(sample_be, 8), "be"))
-        sample_wr = [_f64_wr_array(data, p, n_sample) for p, _ in trio]
-        ranked.append((_ranked_score(sample_wr, 8), "wr"))
-
-    allow_f32 = not (elem_hint == 8 and bc % 8 == 0)
-    if bc % 4 == 0 and allow_f32:
-        n_f32 = bc // 4
-        n_sample = min(n_f32, _COORD_SCORE_SAMPLE)
-        sample_f32 = [_f32_be_array(data, p, n_sample) for p, _ in trio]
-        ranked.append((_ranked_score(sample_f32, 4), "f32"))
-
-    if not ranked:
-        return None, 0
-
-    _, kind = min(ranked, key=lambda item: item[0])
-    if kind == "be":
-        n_vertices = bc // 8
-        axes = [_f64_be_array(data, p, n_vertices) for p, _ in trio]
-        is_wr = False
-    elif kind == "wr":
-        n_vertices = bc // 8
-        axes = [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
-        is_wr = True
-    else:
-        n_vertices = bc // 4
-        axes = [_f32_be_array(data, p, n_vertices) for p, _ in trio]
-        is_wr = False
-
-    xyz = np.column_stack(axes)
-
-    if is_wr:
-        xyz = xyz[:, [0, 2, 1]]
-
-    return xyz, n_vertices
+    """Parse LS_Nodes (float32 / float64 / word-reversed float64)."""
+    return parse_ls_nodes_xyz(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

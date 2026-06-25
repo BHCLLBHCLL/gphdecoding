@@ -92,6 +92,10 @@ def _f64_wr_array(buf, offset: int, count: int) -> np.ndarray:
     return bits.view(">f8").astype(np.float64)
 
 
+def _f32_be_array(buf, offset: int, count: int) -> np.ndarray:
+    return np.frombuffer(buf, dtype=">f4", count=count, offset=offset).astype(np.float64).copy()
+
+
 def _read_conn_continuations(data, pos: int, sec_end: int, got: int,
                              expected: int,
                              conn_parts: Optional[list] = None) -> tuple[int, int, int]:
@@ -759,12 +763,20 @@ def classify_volume_region_cells(
     return all_mask
 
 
+# Minimum plausible max |coordinate| for meter-scale CFD meshes.  float32
+# payload misread as float64 produces denormal magnitudes ~1e-13 (see
+# ``tests/tr03_9.fph``); real vertex coordinates are typically >= ~1e-4 m.
+_COORD_MIN_ABSMAX = 1e-4
+_COORD_MAX_ABSMAX = 1e6
+
+
 def _score_coord_axes(axes: list["np.ndarray"]) -> float:
     """Lower score = more plausible CFD vertex coordinate axes.
 
-    Penalises non-finite values, coordinate magnitudes outside ~[1e-30, 1e6],
-    a high fraction of such outliers (typical of wrong float32/float64 decode),
-    and grossly mismatched axis scales.
+    Penalises non-finite values, coordinate magnitudes outside
+    ~[``_COORD_MIN_ABSMAX``, ``_COORD_MAX_ABSMAX``], a high fraction of such
+    outliers (typical of wrong float32/float64 decode), and grossly mismatched
+    axis scales.
     """
     score = 0.0
     axis_absmax: list[float] = []
@@ -780,15 +792,27 @@ def _score_coord_axes(axes: list["np.ndarray"]) -> float:
             continue
         absmax = float(np.max(absv))
         axis_absmax.append(absmax)
-        if absmax > 1e6 or (absmax < 1e-30 and absmax != 0.0):
+        if absmax > _COORD_MAX_ABSMAX or (
+                absmax < _COORD_MIN_ABSMAX and absmax != 0.0
+        ):
             score += absmax + (1.0 / max(absmax, 1e-300))
         else:
             score += absmax
-        bad_frac = float(
-            ((absv > 1e6) | ((absv < 1e-30) & (absv != 0.0))).mean()
-        )
-        if bad_frac > 0.01:
-            score += 1e20 * bad_frac
+        # Per-value tiny-outlier fraction only when the axis absmax itself
+        # looks misdecoded (e.g. float32 payload read as float64 → ~1e-13).
+        # Do not penalise legitimate meshes whose absmax is O(1) but many
+        # vertices lie near the origin (|x| < 1e-4).
+        if absmax < _COORD_MIN_ABSMAX and absmax != 0.0:
+            bad_frac = float(
+                ((absv > _COORD_MAX_ABSMAX)
+                 | ((absv < _COORD_MIN_ABSMAX) & (absv != 0.0))).mean()
+            )
+            if bad_frac > 0.01:
+                score += 1e20 * bad_frac
+        elif absmax > _COORD_MAX_ABSMAX:
+            bad_frac = float((absv > _COORD_MAX_ABSMAX).mean())
+            if bad_frac > 0.01:
+                score += 1e20 * bad_frac
     pos = [v for v in axis_absmax if v > 0]
     if len(pos) >= 2:
         ratio = max(pos) / min(pos)
@@ -800,7 +824,11 @@ def _score_coord_axes(axes: list["np.ndarray"]) -> float:
 def ls_nodes_descriptor_elem_bytes(
     data, sec_start: int, sec_end: int,
 ) -> Optional[int]:
-    """Return element size (4=float32, 8=float64) from LS_Nodes type descriptors."""
+    """Return element size (4=float32, 8=float64) from LS_Nodes type descriptors.
+
+    Only ``[12, type, n_verts, dim1]`` with ``n_verts > 1`` are counted so
+    metadata markers like ``[12, 4, 1, 1]`` do not skew the vote.
+    """
     counts = {4: 0, 8: 0}
     pos = sec_start + 40
     n = len(data)
@@ -810,7 +838,7 @@ def ls_nodes_descriptor_elem_bytes(
             if tc in (4, 8):
                 dim0 = read_i32_be(data, pos + 8)
                 dim1 = read_i32_be(data, pos + 12)
-                if 0 < dim0 < 10_000_000 and 0 < dim1 < 10_000_000:
+                if dim0 > 1 and 0 < dim1 < 10_000_000:
                     counts[tc] += 1
         pos += 4
     if counts[8] > counts[4]:
@@ -818,6 +846,111 @@ def ls_nodes_descriptor_elem_bytes(
     if counts[4] > counts[8]:
         return 4
     return None
+
+
+def ls_nodes_vertex_count_from_descriptors(
+    data, sec_start: int, sec_end: int,
+) -> Optional[int]:
+    """Return vertex count from ``[12, type, n_verts, …]`` in LS_Nodes."""
+    best = 0
+    pos = sec_start + 40
+    n = len(data)
+    while pos + 16 <= sec_end and pos + 16 <= n:
+        if read_i32_be(data, pos) == 12:
+            tc = read_i32_be(data, pos + 4)
+            if tc in (4, 8):
+                dim0 = read_i32_be(data, pos + 8)
+                dim1 = read_i32_be(data, pos + 12)
+                if dim0 > 1 and 0 < dim1 < 10_000_000:
+                    best = max(best, dim0)
+        pos += 4
+    return best if best > 0 else None
+
+
+_COORD_SCORE_SAMPLE = 256
+_ELEM_PRIOR_MISMATCH = 1e15
+_F32_ON_F64_ALIGNED_PRIOR = 10.0
+
+
+def parse_ls_nodes_xyz(data: bytes) -> tuple[Optional["np.ndarray"], int]:
+    """Parse LS_Nodes → ``(xyz float64 N×3, n_vertices)``.
+
+    Supports standard BE float64, word-reversed float64, and BE float32
+    (FPH / ``tests/tr03_9.fph``).
+    """
+    sec_start = find_section(data, "LS_Nodes")
+    if sec_start < 0:
+        return None, 0
+    sec_end = section_end(data, sec_start)
+
+    blocks = list(iter_data_blocks(data, sec_start, sec_end))
+    f_blocks = [(p, bc) for p, bc in blocks if bc >= 4 and bc % 4 == 0]
+    if len(f_blocks) < 3:
+        return None, 0
+
+    sizes = [bc for _, bc in f_blocks]
+    target = max(set(sizes), key=sizes.count)
+    trio = [(p, bc) for p, bc in f_blocks if bc == target][:3]
+    if len(trio) < 3:
+        return None, 0
+
+    bc = trio[0][1]
+    elem_hint = ls_nodes_descriptor_elem_bytes(data, sec_start, sec_end)
+    n_desc = ls_nodes_vertex_count_from_descriptors(data, sec_start, sec_end)
+
+    def _ranked_score(sample_axes: list["np.ndarray"], elem_bytes: int) -> float:
+        s = _score_coord_axes(sample_axes)
+        if elem_hint is not None and elem_bytes != elem_hint:
+            s += _ELEM_PRIOR_MISMATCH
+        elif elem_hint is None and elem_bytes == 4 and bc % 8 == 0:
+            s += _F32_ON_F64_ALIGNED_PRIOR
+        return s
+
+    ranked: list[tuple[float, str]] = []
+
+    if bc % 8 == 0:
+        n_f64 = bc // 8
+        if n_desc is None or n_desc == n_f64:
+            n_sample = min(n_f64, _COORD_SCORE_SAMPLE)
+            ranked.append((
+                _ranked_score([_f64_be_array(data, p, n_sample) for p, _ in trio], 8),
+                "be",
+            ))
+            ranked.append((
+                _ranked_score([_f64_wr_array(data, p, n_sample) for p, _ in trio], 8),
+                "wr",
+            ))
+
+    if bc % 4 == 0 and elem_hint != 8:
+        n_f32 = n_desc if n_desc is not None else bc // 4
+        if n_desc is None or n_desc == bc // 4:
+            n_sample = min(n_f32, _COORD_SCORE_SAMPLE)
+            ranked.append((
+                _ranked_score([_f32_be_array(data, p, n_sample) for p, _ in trio], 4),
+                "f32",
+            ))
+
+    if not ranked:
+        return None, 0
+
+    _, kind = min(ranked, key=lambda item: item[0])
+    if kind == "be":
+        n_vertices = n_desc if n_desc is not None else bc // 8
+        axes = [_f64_be_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = False
+    elif kind == "wr":
+        n_vertices = n_desc if n_desc is not None else bc // 8
+        axes = [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = True
+    else:
+        n_vertices = n_desc if n_desc is not None else bc // 4
+        axes = [_f32_be_array(data, p, n_vertices) for p, _ in trio]
+        is_wr = False
+
+    xyz = np.column_stack(axes)
+    if is_wr:
+        xyz = xyz[:, [0, 2, 1]]
+    return xyz, n_vertices
 
 
 def _ls_nodes_coordinate_layout(data) -> Optional[dict]:
