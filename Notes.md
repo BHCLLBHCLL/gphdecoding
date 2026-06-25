@@ -97,6 +97,19 @@ if (conn >= n_vertices).any() or np.isin(conn, list(SENTINELS)).any():
 
 ---
 
+## LS_Nodes float32（FPH / tr03_9）
+
+FPH 网格（如 `tests/tr03_9.fph`）的 `LS_Nodes` 描述符 **type=4**，三轴块为 **float32 BE**（`byte_count = n_verts × 4`）。
+
+若按 float64 误读：
+
+- 坐标幅值落在 ~**1e-13**（denormal），旧版 ``1e-30`` 阈值会误判为合理；
+- 顶点数按 ``bc // 8`` 计算 → **减半**（221786 → 110893），conn 索引越界或 ParaView 挂起。
+
+**修复**（§11.14）：`gph_model.parse_ls_nodes_xyz()` 统一 float32 / f64 BE / word-reversed；``_COORD_MIN_ABSMAX = 1e-4`` m；顶点数取自描述符 ``dim0``。
+
+---
+
 ## 小结
 
 | 项目 | 说明 |

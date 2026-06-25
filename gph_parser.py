@@ -130,7 +130,7 @@ def _section_blurb(name: str) -> str:
     blurbs = {
         "LS_CvolIdOfElements": "I4[n_cells] per-cell cvol_id (opaque Part id, not list index)",
         "LS_Links": "face topology: owner, neighbor, npe, conn (CSR; may split >1 GiB, multi-chunk)",
-        "LS_Nodes": "R8[n,3] vertex coords (three float64 axis blocks)",
+        "LS_Nodes": "R4/R8[n,3] vertex coords (three axis blocks; float32 or float64 BE)",
         "LS_SurfaceRegions": "named BC regions -> global face id lists",
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
         "LS_Parts": "part names + cvol spec (single id or membership list; see format_description §10)",
@@ -177,9 +177,18 @@ def format_description() -> str:
 
 4. LS_Nodes - vertex coordinates
 --------------------------------
-  Three equal-sized float64 axis blocks (X, Y, Z file order).
-  Dialect auto-detection: standard big-endian float64 vs word-reversed
-  (legacy); word-reversed files use X,Z,Y on disk -> permuted to X,Y,Z.
+  Three equal-sized axis blocks (X, Y, Z file order).  Type from 16-byte
+  descriptors: type 4 = float32 (R4), type 8 = float64 (R8).  FPH meshes
+  (e.g. tests/tr03_9.fph) use float32; ANSA exports use float64.
+
+  gph_model.parse_ls_nodes_xyz() auto-selects among:
+    - big-endian float32 (descriptor type 4)
+    - standard big-endian float64
+    - word-reversed float64 (legacy; disk order X,Z,Y -> permuted to X,Y,Z)
+
+  Scoring uses _COORD_MIN_ABSMAX = 1e-4 m so float32 payload misread as
+  float64 (~1e-13 denormals) loses to the correct decode.  Vertex count
+  comes from descriptors (dim0 where dim0 > 1), not payload byte_count // 8.
 
 5. LS_Links - face / cell topology
 ----------------------------------
@@ -201,8 +210,13 @@ def format_description() -> str:
     [12, bc1][conn part 1][bc1]              <- standard block (bc1 often 1 GiB)
     [I4=1073741824][conn part 2 raw...]      <- bare byte_count + payload (no [I4=12])
     ... further 1 GiB bare chunks as needed ...
-    [I4=bcN][conn final raw...]              <- last chunk; bcN may repeat 1 GiB
-                                               marker with a shorter payload
+    [I4=1073741824][I4=bcN][conn final...]   <- last chunk (3+ segments): repeat
+                                               1 GiB marker + actual payload bytes
+                                               + data; misreading bcN as a vertex
+                                               index causes face warping at the
+                                               2nd GiB boundary (see DEV_SUMMARY
+                                               §11.13).  Two-segment files use
+                                               single-header [I4=bcN][payload].
 
   Conn block selection: if no block matches sum(npe) exactly, pick the
   largest non-triple I4 block with byte_count >= 12 (not 3*n_faces*4, which

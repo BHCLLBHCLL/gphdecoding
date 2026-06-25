@@ -309,55 +309,25 @@ def parse_ls_nodes_vertices(
     """Parse LS_Nodes -> (coord_sample, dialect_label, n_vertices).
 
     For large meshes only *max_preview* coordinates are materialised (for
-    display); the full vertex count is always returned.
+    display); the full vertex count is always returned.  Delegates to
+    :func:`parse_ls_nodes_xyz` (float32 / float64 / word-reversed).
     """
+    xyz, n_vertices = parse_ls_nodes_xyz(data)
+    if xyz is None or n_vertices == 0:
+        return None, "", 0
+
     sec_start = find_section(data, "LS_Nodes")
-    if sec_start < 0:
-        return None, "", 0
     sec_end = section_end(data, sec_start)
-    blocks = list(iter_data_blocks(data, sec_start, sec_end))
-    f64_blocks = [(p, bc) for p, bc in blocks if bc >= 8 and bc % 8 == 0]
-    if len(f64_blocks) < 3:
-        return None, "", 0
-    sizes = [bc for _, bc in f64_blocks]
-    target = max(set(sizes), key=sizes.count)
-    trio = [(p, bc) for p, bc in f64_blocks if bc == target][:3]
-    if len(trio) < 3:
-        return None, "", 0
-    n_vertices = trio[0][1] // 8
-
-    def _decode_be():
-        return [_f64_be_array(data, p, n_vertices) for p, _ in trio]
-
-    def _decode_wr():
-        return [_f64_wr_array(data, p, n_vertices) for p, _ in trio]
-
-    def _score(axes):
-        score = 0.0
-        for ax in axes:
-            finite = np.isfinite(ax)
-            if not finite.all():
-                score += 1e30
-                continue
-            absmax = float(np.max(np.abs(ax))) if ax.size else 0.0
-            if absmax > 1e6 or absmax < 1e-30 and absmax != 0.0:
-                score += absmax + (1.0 / max(absmax, 1e-300))
-            else:
-                score += absmax
-        return score
-
-    axes_be = _decode_be()
-    axes_wr = _decode_wr()
-    if _score(axes_be) <= _score(axes_wr):
-        axes, dialect = axes_be, "standard BE float64"
-        col_perm = (0, 1, 2)
+    elem_hint = ls_nodes_descriptor_elem_bytes(data, sec_start, sec_end)
+    if elem_hint == 4:
+        dialect = "big-endian float32"
     else:
-        axes, dialect = axes_wr, "word-reversed float64"
-        col_perm = (0, 2, 1)
+        layout = _ls_nodes_coordinate_layout(data)
+        dialect = layout["dialect"] if layout else "standard BE float64"
+
     n_show = min(n_vertices, max_preview)
     sample = [
-        (float(axes[col_perm[0]][i]), float(axes[col_perm[1]][i]),
-         float(axes[col_perm[2]][i]))
+        (float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]))
         for i in range(n_show)
     ]
     return sample, dialect, n_vertices
@@ -1300,10 +1270,11 @@ class GphDocument:
         if name == "LS_Nodes":
             sample, dialect, n_vertices = parse_ls_nodes_vertices(file_data)
             if n_vertices:
-                dtype = f"R8[{n_vertices},3] ({dialect})"
+                elem = "R4" if "float32" in dialect else "R8"
+                dtype = f"{elem}[{n_vertices},3] ({dialect})"
                 return GphNode(name, offset, len(raw), dtype,
                                value=sample, raw=raw, children=[])
-            return GphNode(name, offset, len(raw), "R8[]", value=None, raw=raw, children=[])
+            return GphNode(name, offset, len(raw), "R4/R8[]", value=None, raw=raw, children=[])
 
         if name == "LS_Links":
             summary = parse_ls_links_summary(file_data)

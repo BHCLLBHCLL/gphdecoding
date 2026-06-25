@@ -707,9 +707,10 @@ class GphViewerMain(QMainWindow):
 
     def on_table_cell_changed(self, item: QTableWidgetItem):
         # Vertex / topology / partition arrays are read-only in the viewer.
-        # Coordinates live in three separate float64 axis blocks with optional
-        # word-reversed encoding; LS_Links uses variable-length CSR connectivity
-        # for polyhedral meshes — inline edits are not supported.
+        # Coordinates: three separate axis blocks (float32 or float64 BE, optional
+        # word-reversed f64); parsed via gph_model.parse_ls_nodes_xyz.  LS_Links
+        # uses variable-length CSR connectivity for polyhedral meshes — inline
+        # edits are not supported.
         if self._table_loading or not self.current_node:
             return
         # No-op: keep the table read-only for vertex arrays.

@@ -8,9 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |---------|---------|
 | Parse/inspect GPH format | `python3 gph_parser.py [file.gph]` |
 | Convert GPH → CGNS/HDF5 | `python3 gph2cgns.py input.gph -o output.cgns` |
+| Convert FPH → CGNS (with fields) | `python3 fph2cgns.py input.fph -o output.cgns` |
 | Single-zone export | `python3 gph2cgns.py input.gph --single-zone -z ZoneName` |
 | GPH Viewer GUI | `python3 gphviewer.py [file.gph]` |
 | Headless viewer (CI/server) | `QT_QPA_PLATFORM=offscreen python3 gphviewer.py file.gph` |
+| Coord dialect regression | `python3 tests/test_coord_score.py -v` |
 | Lint | `~/.local/bin/ruff check *.py` |
 | Syntax check | `python3 -m py_compile <file>.py` |
 
@@ -27,7 +29,8 @@ This is a **flat Python CLI/GUI toolkit** for reverse-engineering and converting
 ### File roles
 
 - **`gph_model.py`** — Shared library: data types (`GphNode`, `GphDocument`), binary section scanners, heuristics for vertex-coordinate dialect detection, LS_Links/LS_Parts/LS_Assemblies parsers, mesh-preview builder. **Single source of truth** for GPH parsing logic, including `parse_ls_parts()` / cvol_id resolution.
-- **`gph2cgns.py`** — Converter: retains its own low-level section scanners for self-contained deployment, but imports `_read_conn_continuations` and `parse_ls_parts` from `gph_model`. Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility.
+- **`gph2cgns.py`** — Mesh-only converter: imports `parse_ls_nodes_xyz`, `_read_conn_continuations`, and `parse_ls_parts` from `gph_model`. Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility.
+- **`fph2cgns.py`** — FPH converter (mesh + FlowSolution field data): same mesh parsing as `gph2cgns` via `parse_ls_nodes_xyz`.
 - **`gph_parser.py`** — CLI inspector: imports all parsing functions from `gph_model`, prints structured section layout and format description.
 - **`gphviewer.py`** — PyQt GUI browser/editor: imports parsing functions from `gph_model`, builds tree view + hex dump + data table + 3D mesh preview via `MeshPreviewWidget`.
 
@@ -43,11 +46,13 @@ Section offsets vary per file. All tools locate sections dynamically by scanning
 
 ### Vertex coordinate dialect auto-detection
 
-`LS_Nodes` contains three equal-sized float64 axis blocks (X, Y, Z file order). Two encodings exist:
-1. **Standard big-endian float64** (modern files from current ANSA/scFLOW pipelines)
-2. **Word-reversed float64** (legacy — each 8-byte double stored as `[low32_BE][high32_BE]`, and axes on disk are X, Z, Y)
+`LS_Nodes` contains three equal-sized axis blocks (X, Y, Z file order). Encodings:
 
-The parser decodes both and picks the one whose coordinate magnitudes look physically plausible (finite, magnitude ≤ 1e6, ≥ 1e-30).
+1. **Big-endian float32** (FPH solver-result files, e.g. `tests/tr03_9.fph` — descriptor type 4)
+2. **Standard big-endian float64** (modern ANSA/scFLOW GPH exports)
+3. **Word-reversed float64** (legacy — each 8-byte double stored as `[low32_BE][high32_BE]`, disk axes X, Z, Y)
+
+**Canonical parser**: `gph_model.parse_ls_nodes_xyz()` (used by `gph2cgns`, `fph2cgns`, `gph_parser`, `gphviewer`). It scores candidate decodings with `_score_coord_axes` using `_COORD_MIN_ABSMAX = 1e-4` m so float32 misread as float64 (~1e-13 denormals) loses. Vertex count comes from type descriptors (`dim0`), not `byte_count // 8`.
 
 ### LS_Links conn splitting (files > ~1 GiB connectivity)
 

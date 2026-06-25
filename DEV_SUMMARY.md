@@ -804,6 +804,23 @@ conn     : 513041554 entries in 2 chunks
 | `tests/laptop_simplified_voxel_v9.gph` | `713679784` | `66960602` |
 | `tests/laptop_simplified_voxel_v4.gph` | （无） | `33723175` |
 
+### 11.14 LS_Nodes float32 坐标打分（tr03_9 / FPH）
+
+**现象**：`tests/tr03_9.fph` 经 `gph2cgns.py` 转换后 `FluidRegion` 仅 **110893** 顶点（应为 **221786**），ParaView 打开 `tr03_9.cgns` 挂起；同文件经 `fph2cgns.py` 转换正常。
+
+**根因**：FPH 网格 `LS_Nodes` 描述符为 **type=4（float32）**，三轴块 `byte_count = n×4`。旧版 `_parse_ls_nodes` 仅在 float64 / word-reversed 间打分，且 ``_COORD_MIN_ABSMAX = 1e-30``：float32 payload 误读为 float64 时坐标幅值 ~1e-13，反而比真实 f32 得分更低，被选中；顶点数按 ``bc // 8`` 减半。
+
+**修复**（`gph_model.py`）：
+
+| 项 | 内容 |
+|----|------|
+| 统一入口 | `parse_ls_nodes_xyz()` — `gph2cgns` / `fph2cgns` / `gph_parser` / `gphviewer` 共用 |
+| 阈值 | `_COORD_MIN_ABSMAX = 1e-4` m（meter 量级 CFD 网格） |
+| 顶点数 | `ls_nodes_vertex_count_from_descriptors()` — 描述符 `dim0`（`dim0 > 1`） |
+| 类型提示 | `ls_nodes_descriptor_elem_bytes()` — 描述符 type 4/8 作先验 |
+
+**验证**：`tests/test_coord_score.py`（含 tr03_9 对 gph2cgns / fph2cgns）；修复后 `gph2cgns tests/tr03_9.fph` → 221786 顶点。
+
 ### 11.9 LS_Parts cvol_id 扫描首值 sanity check（#14）
 
 > **状态**：已被 §11.11 取代；以下保留作历史记录。
@@ -1095,7 +1112,8 @@ I4[N]            ← 显式列出该 Part 拥有的全部 cvol_id
 |------|------|
 | **`gph_model.py`** | 共享解析库。字节序读取(标准 BE float64 + 词序反转)、段定位(`find_section`)、数据块扫描(`iter_data_blocks`)、`LS_Links` / `LS_Parts` / `LS_Nodes` / `LS_SurfaceRegions` / `LS_Assemblies` 解析、`part_cvol_cell_mask`、可编辑树模型 `GphNode` / `GphDocument`(>512 MiB 自动 mmap)、`build_mesh_preview` 用于交互预览。|
 | **`gph_parser.py`** | CLI 检视器:动态扫描所有命名段,输出 section 布局、网格拓扑摘要、partition 元数据、cvol 集合,以及完整格式说明字符串。|
-| **`gph2cgns.py`** | 核心转换器。`_parse_ls_nodes` 自动检测 BE / 词序反转编码;`_parse_ls_links` 处理 owner / neighbour / npe + conn(支持 >1 GiB 1 GiB 分片延续);`_extract_zone_submesh` 为每个 zone 抽取子网格并重编号(法向反向时反转节点顺序);`_write_ngon` / `_write_nface` / `_write_zone_bc` 写 CGNS,HDF5 v0 超级块 + 紧凑组(`track_order=False`)以兼容 ANSA。Zone 计划由 `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies`(含 `root_empty_prefix` 启发式)驱动,空元数据时回退到 `FluidRegion` + `FPHPARTS.box_vol`。|
+| **`gph2cgns.py`** | 核心转换器。`_parse_ls_nodes` → `parse_ls_nodes_xyz`（float32 / BE f64 / 词序反转）;`_parse_ls_links` 处理 owner / neighbour / npe + conn(支持 >1 GiB 1 GiB 分片延续);`_extract_zone_submesh` 为每个 zone 抽取子网格并重编号(法向反向时反转节点顺序);`_write_ngon` / `_write_nface` / `_write_zone_bc` 写 CGNS,HDF5 v0 超级块 + 紧凑组(`track_order=False`)以兼容 ANSA。Zone 计划由 `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies`(含 `root_empty_prefix` 启发式)驱动,空元数据时回退到 `FluidRegion` + `FPHPARTS.box_vol`。|
+| **`fph2cgns.py`** | FPH（含 FlowSolution 求解结果）→ CGNS。网格解析与 `gph2cgns` 共用 `parse_ls_nodes_xyz` / `gph_model`；额外读取 FPH 节内 float32 场数据写入 `FlowSolution`。|
 | **`gphviewer.py`** | PyQt6 / 5 GUI(类似 HDFView):树视图 + 十六进制 / 表格 + 多边形 3D 预览,支持 zone / face 选择高亮。|
 | **`tests/test_volume_zone_cells.py`** | 回归测试:对照 `*_orig.cgns` 验证每个 zone 的 cell 数(`-v` 输出 LS_Parts 链、cvol_id 直方图)。|
 
@@ -1103,7 +1121,7 @@ I4[N]            ← 显式列出该 Part 拥有的全部 cvol_id
 
 - **大文件友好**:文件 >512 MiB 走 `mmap`;>~1 GiB 的 `conn` 自动续接,支持标准 `[12,bc][payload][bc]` 与裸 `[I4=bc][payload]` 1 GiB 块混合出现(见 `gph_model._read_conn_continuations`)。
 - **复合 Part**:`air_domain` 这类背景流体使用 `[12,4,N,4] + I4[N]` 成员列表,`PartCvolSpec = int | frozenset[int]`(其中 `N` 是后续成员列表的长度,不是 cvol_id)。
-- **编码方言自动识别**:legacy GPH 词序反转 float64(列序 X,Z,Y),新文件标准 BE,`_score_coord_axes` 启发式按"坐标量级是否物理合理"打分,低分胜出。
+- **编码方言自动识别**: `parse_ls_nodes_xyz()` 统一 float32 BE、标准 BE float64、legacy 词序反转 float64（列序 X,Z,Y）；`_score_coord_axes` 使用 `_COORD_MIN_ABSMAX=1e-4` m 避免 float32 误读为 f64；顶点数取自描述符而非 `bc//8`。
 - **CGNS / ANSA 兼容**:HDF5 v0 超级块 + `libver=("earliest", "v108")` + 标准 4 属性(flags / label / name / type);ZoneBC 完整 BC 家族(空 PointList 也保留 group,与 `tr03_orig.cgns` 字节级匹配)。
 - **Vertex 重编号**:首次出现的面节点重排,顺序对齐 FLDUTIL 导出器;被使用过的节点先排,从未引用的尾追。
 - **Zone 抽取**:`_extract_zone_submesh` 复用 `link_data` 结构,跨 zone 边界的 face 自动翻转为新边界(以 zone 内 cell 为 owner,必要时反转节点序保持法向朝外)。

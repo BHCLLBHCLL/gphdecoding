@@ -9,9 +9,11 @@ This is a flat Python CLI/GUI toolkit for converting `.gph` (proprietary CFD mes
 | Tool | Command | Notes |
 |------|---------|-------|
 | GPH Parser | `python3 gph_parser.py tests/box_ansa.gph` | Outputs section layout and format description |
-| GPH→CGNS Converter | `python3 gph2cgns.py tests/box_ansa.gph -o output.cgns` | Core functionality; requires numpy + h5py |
+| GPH→CGNS Converter | `python3 gph2cgns.py tests/box_ansa.gph -o output.cgns` | Mesh-only CGNS; supports float32/float64 LS_Nodes |
+| FPH→CGNS Converter | `python3 fph2cgns.py tests/tr03_9.fph -o output.cgns` | FPH with FlowSolution fields; same mesh parsing as gph2cgns |
 | GPH Viewer (GUI) | `QT_QPA_PLATFORM=offscreen python3 gphviewer.py tests/box_ansa.gph` | PyQt6 GUI; use `QT_QPA_PLATFORM=offscreen` in headless environments |
 | Zone cell test | `python3 tests/test_volume_zone_cells.py -v` | Compare zone plan vs `*_orig.cgns`; `-v` shows simple/composite Part cvol specs |
+| Coord dialect test | `python3 tests/test_coord_score.py -v` | LS_Nodes float32/float64 scoring; includes `tests/tr03_9.fph` |
 
 ### Lint / Test / Build
 
@@ -30,4 +32,5 @@ Installed via `pip install numpy h5py PyQt6`. The `requirements.txt` lists PyQt5
 - The viewer (`gphviewer.py`) auto-detects PyQt6 first, then falls back to PyQt5. On Python 3.12+ only PyQt6 works.
 - `ruff` is installed to `~/.local/bin/` which may not be on PATH; use full path or add it to PATH.
 - The sample meshes for regression live under **`tests/`** (`box_ansa.gph`, `laptop_simplified_voxel_less.gph`, matching `*_orig.cgns`). Larger samples (`tr03.gph`, `laptop_simplified*.gph`) remain in the repo root.
+- **LS_Nodes parsing** is centralized in `gph_model.parse_ls_nodes_xyz()` (float32 / float64 BE / word-reversed). Do not duplicate dialect logic in converters or the viewer.
 - **LS_Parts cvol_id mapping** lives in `gph_model.parse_ls_parts(data, cvol_id=…)` → `PartCvolSpec` (`int` or `frozenset` for composite parts like `air_domain`). Zone masks: `part_cvol_cell_mask()`. `gph2cgns` imports this — do not duplicate. Multi-region laptop files (`laptop_simplified_more_regions.gph`) use `[12,4,N,4]+I4[N]` membership lists; **N is a count, not a cvol_id**.

@@ -8,11 +8,12 @@ Reverse-engineer and convert **GPH** (Software Cradle scFLOW / SCTpre CFD mesh) 
 |------|------|
 | **gph_model.py** | Shared parsing library (`parse_ls_parts`, `parse_ls_cvol_ids`, mesh topology, tree model) |
 | **gph_parser.py** | CLI inspector — section layout, format description, partition summary |
-| **gph2cgns.py** | GPH → CGNS/HDF5 converter (multi-zone, polyhedral NGON_n / NFACE_n) |
+| **gph2cgns.py** | GPH / FPH mesh → CGNS/HDF5 (multi-zone, polyhedral NGON_n / NFACE_n) |
+| **fph2cgns.py** | FPH → CGNS with FlowSolution field data (uses same mesh parsing as gph2cgns) |
 | **gphviewer.py** | PyQt GUI browser/editor (tree + hex dump + 3D preview) |
 | **GPH_FORMAT_SPEC.md** | Reverse-engineered GPH binary format specification (Chinese) |
 | **DEV_SUMMARY.md** | Development log and design decisions |
-| **tests/test_volume_zone_cells.py** | Partition regression test (GPH zone plan vs `*_orig.cgns`) |
+| **tests/test_coord_score.py** | LS_Nodes float32/float64 dialect regression (incl. `tr03_9.fph`) |
 
 Sample meshes: `tests/box_ansa.gph`, `tests/laptop_simplified_voxel_less.gph`, `tests/laptop_simplified_more_regions.gph` (composite `air_domain` Part); matching `*_orig.cgns` where present.
 
@@ -24,12 +25,18 @@ python gph_parser.py [file.gph]
 ```
 Outputs section layout, data samples, and full format description.
 
-### Convert GPH to CGNS
+### Convert GPH / FPH to CGNS
 ```bash
 python gph2cgns.py tests/box_ansa.gph -o box.cgns
 python gph2cgns.py input.gph -o output.cgns -z ZoneName   # single-zone export
+python fph2cgns.py tests/tr03_9.fph -o tr03_9.cgns      # FPH + FlowSolution fields
 ```
 Requires: `pip install numpy h5py`
+
+### Test coordinate dialect detection
+```bash
+python tests/test_coord_score.py -v
+```
 
 ### Test volume-zone cell counts
 ```bash
