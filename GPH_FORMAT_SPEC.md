@@ -284,6 +284,21 @@ Zone 命名规则（与 FLDUTIL 对齐，见 `DEV_SUMMARY.md` §10）：
 
 UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_paths` 与 `root_empty_prefix`（首个顶层 assembly 下、与根级 part 数量相同的**空** assembly 名拼接），用于 Part Zone 命名。
 
+### 5.8 LS_SPHFile（FPH 求解结果，可选）
+
+FPH 文件在网格元数据之后追加 ``LS_SPHFile`` 节（纯 GPH 无此节）。布局为重复的变量记录：
+
+```
+[32B ASCII 名]  EC_Scalar:PRES / EC_Vector:VEL 等
+[描述符 + 可选 4B 块 + 32B ASCII 说明]
+[1 × (n_cells × 4B)  float32 BE]   标量
+或 [3 × (n_cells × 4B)  float32 BE]  矢量 X/Y/Z
+```
+
+命名映射：`EC_Scalar:NAME` → CGNS 变量 ``NAME``；``EC_Vector:NAME`` → ``NAMEX`` / ``NAMEY`` / ``NAMEZ``。
+
+``fph2cgns.py`` 按 zone 的 cell 掩码切片场数据，写入各 ``Zone_t`` 下 ``FlowSolution_t`` 的 ``DataArray_t``（默认 **R4 float32**；``--flow-f64`` 为 R8）。``--skip-fluid-region`` 从输出中**完全省略** ``FluidRegion`` Zone（不仅是不写字段）。
+
 ## 6. CGNS 多 Zone 输出概要
 
 `gph2cgns.py` 根据 `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies` 生成多个 `Zone_t`，每个 Zone 为全局网格的子集（顶点/面重编号），并附带：
@@ -291,7 +306,9 @@ UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_path
 - `GridElements_Faces`（NGON_n=22）  
 - 与 Zone 同名的 `NFACE_n`（带符号面索引）  
 - `ZoneBC`：来自 `LS_SurfaceRegions` 的命名 BC 族  
-- `FlowSolution` 占位  
+- `FlowSolution`：仅 `GridLocation = "CellCenter"` 占位（`gph2cgns`）
+
+``fph2cgns.py`` 同上，且从 ``LS_SPHFile`` 写入各 zone 的场变量（PRES、VEL 等）；CLI 见 §5.8。
 
 无分区元数据时回退为 `FluidRegion` + `FPHPARTS.box_vol` 两 Zone（`box_ansa.gph` 行为）。
 
@@ -307,10 +324,18 @@ UTF-8 XML，描述 `<assembly>` / `<part>` 层次。`gph2cgns` 解析 `part_path
 
 ## 7. 使用 Python 解析与验证
 
-解析 GPH 结构：
+解析 GPH / FPH 结构：
 
 ```bash
-python gph_parser.py [file.gph]    # 默认 tests/box_ansa.gph
+python gph_parser.py [file.gph]    # 默认 tests/box_ansa.gph；FPH 会列出 LS_SPHFile 节
+```
+
+FPH → CGNS（含 FlowSolution）：
+
+```bash
+python fph2cgns.py tests/tr03_9.fph -o tr03_9.cgns
+python fph2cgns.py tests/tr03_9.fph -o out.cgns --skip-fluid-region
+python fph2cgns.py tests/tr03_9.fph -o out.cgns --flow-f64
 ```
 
 对比体区域 Zone cell 数（需 `tests/{name}_orig.cgns` 参考文件）：

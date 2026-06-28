@@ -234,7 +234,7 @@ _SECTION_BOUNDARY_NAMES = [
     "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
     "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
     "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
-    "LS_Assemblies", "Element_InformationFlag", "OverlapEnd",
+    "LS_Assemblies", "LS_SPHFile", "Element_InformationFlag", "OverlapEnd",
 ]
 
 

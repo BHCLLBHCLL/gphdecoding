@@ -59,7 +59,7 @@ def _parse_gph_buffer(data, filepath: str) -> dict:
         "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
         "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
         "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
-        "LS_Assemblies", "Element_InformationFlag", "OverlapEnd",
+        "LS_Assemblies", "LS_SPHFile", "Element_InformationFlag", "OverlapEnd",
     ]
     found = []
     for name in section_names:
@@ -135,6 +135,7 @@ def _section_blurb(name: str) -> str:
         "LS_VolumeRegions": "volume region names (-> CGNS zones)",
         "LS_Parts": "part names + cvol spec (single id or membership list; see format_description §10)",
         "LS_Assemblies": "XML assembly tree for zone naming",
+        "LS_SPHFile": "FPH solver results (EC_Scalar/EC_Vector float32 cell fields)",
         "LS_SolverUnusedRegions": "solver-internal region names",
         "Element_InformationFlag": "per-element flags",
     }
@@ -280,8 +281,25 @@ def format_description() -> str:
 ----------------------------
   Writes FLDUTIL-compatible CGNS/HDF5: NGON_n faces, NFACE_n cells (signed
   face ids), multi-zone layout from partition metadata, per-zone BC families.
-  HDF5 superblock v0 (libver earliest) for ANSA compatibility - see
-  GPH_FORMAT_SPEC.md section 9 and DEV_SUMMARY.md.
+  FlowSolution: GridLocation skeleton only (no field data).  HDF5 superblock
+  v0 (libver earliest) for ANSA compatibility - see GPH_FORMAT_SPEC.md and
+  DEV_SUMMARY.md.
+
+13. FPH export (fph2cgns.py)
+----------------------------
+  FPH = GPH mesh + LS_SPHFile solver results.  Same mesh/zone logic as
+  gph2cgns; additionally parses LS_SPHFile (EC_Scalar:VAR / EC_Vector:VAR
+  records, n_cells x float32 BE per component) and writes per-zone
+  FlowSolution_t DataArray_t nodes.
+
+  CLI options:
+    --flow-f64           Write FlowSolution as R8 (float64); default R4 (float32)
+    --skip-fluid-region  Do not emit FluidRegion Zone_t at all
+    --clip-flow 1        Reset field values > 1e20 to 0 (solver sentinels)
+    --single-zone / -z   Single Zone_t export (legacy)
+
+  Example:
+    python fph2cgns.py tests/tr03_9.fph -o tr03_9.cgns --skip-fluid-region
 
 ================================================================================
 """

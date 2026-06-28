@@ -821,6 +821,23 @@ conn     : 513041554 entries in 2 chunks
 
 **验证**：`tests/test_coord_score.py`（含 tr03_9 对 gph2cgns / fph2cgns）；修复后 `gph2cgns tests/tr03_9.fph` → 221786 顶点。
 
+### 11.15 fph2cgns FlowSolution 与 Zone 过滤
+
+**背景**：FPH 求解结果在 ``LS_SPHFile``（``EC_Scalar`` / ``EC_Vector``，每单元 float32 BE）。``fph2cgns.py`` 在 ``gph2cgns`` 多 Zone 布局上为每个 zone 写入 ``FlowSolution_t`` 场变量。
+
+**CLI 行为**（2025-05 起）：
+
+| 开关 | 作用 |
+|------|------|
+| （默认） | FlowSolution ``DataArray_t`` 为 **R4 float32**（与 FPH 源一致） |
+| ``--flow-f64`` | 场变量写 **R8 float64**（兼容旧参考 CGNS） |
+| ``--skip-fluid-region`` | **不输出** ``FluidRegion`` 整个 ``Zone_t``（网格+BC+场）；其余 zone 不变 |
+| ``--clip-flow 1`` | 将 > 1e20 的场值置 0（求解器哨兵） |
+
+**实现**：``_parse_fph_flow_solution()`` 读 ``LS_SPHFile``；``write_cgns(..., flow_f64=, skip_fluid_region=)``；``_filter_zone_plan()`` 从 emit 列表剔除 ``FluidRegion``。若过滤后无 zone 则报错。
+
+**验证**：``python fph2cgns.py tests/tr03_9.fph -o /tmp/t.cgns --skip-fluid-region`` → CGNS 中无 ``FluidRegion``，其余 6 个 zone 含 11 个场变量。
+
 ### 11.9 LS_Parts cvol_id 扫描首值 sanity check（#14）
 
 > **状态**：已被 §11.11 取代；以下保留作历史记录。
@@ -1113,7 +1130,7 @@ I4[N]            ← 显式列出该 Part 拥有的全部 cvol_id
 | **`gph_model.py`** | 共享解析库。字节序读取(标准 BE float64 + 词序反转)、段定位(`find_section`)、数据块扫描(`iter_data_blocks`)、`LS_Links` / `LS_Parts` / `LS_Nodes` / `LS_SurfaceRegions` / `LS_Assemblies` 解析、`part_cvol_cell_mask`、可编辑树模型 `GphNode` / `GphDocument`(>512 MiB 自动 mmap)、`build_mesh_preview` 用于交互预览。|
 | **`gph_parser.py`** | CLI 检视器:动态扫描所有命名段,输出 section 布局、网格拓扑摘要、partition 元数据、cvol 集合,以及完整格式说明字符串。|
 | **`gph2cgns.py`** | 核心转换器。`_parse_ls_nodes` → `parse_ls_nodes_xyz`（float32 / BE f64 / 词序反转）;`_parse_ls_links` 处理 owner / neighbour / npe + conn(支持 >1 GiB 1 GiB 分片延续);`_extract_zone_submesh` 为每个 zone 抽取子网格并重编号(法向反向时反转节点顺序);`_write_ngon` / `_write_nface` / `_write_zone_bc` 写 CGNS,HDF5 v0 超级块 + 紧凑组(`track_order=False`)以兼容 ANSA。Zone 计划由 `LS_VolumeRegions` + `LS_Parts` + `LS_Assemblies`(含 `root_empty_prefix` 启发式)驱动,空元数据时回退到 `FluidRegion` + `FPHPARTS.box_vol`。|
-| **`fph2cgns.py`** | FPH（含 FlowSolution 求解结果）→ CGNS。网格解析与 `gph2cgns` 共用 `parse_ls_nodes_xyz` / `gph_model`；额外读取 FPH 节内 float32 场数据写入 `FlowSolution`。|
+| **`fph2cgns.py`** | FPH → CGNS。网格与 `gph2cgns` 共用 `parse_ls_nodes_xyz` / `gph_model`；解析 `LS_SPHFile` 写各 zone 的 FlowSolution（默认 R4；`--flow-f64`）。`--skip-fluid-region` 经 `_filter_zone_plan()` 省略整个 FluidRegion Zone。|
 | **`gphviewer.py`** | PyQt6 / 5 GUI(类似 HDFView):树视图 + 十六进制 / 表格 + 多边形 3D 预览,支持 zone / face 选择高亮。|
 | **`tests/test_volume_zone_cells.py`** | 回归测试:对照 `*_orig.cgns` 验证每个 zone 的 cell 数(`-v` 输出 LS_Parts 链、cvol_id 直方图)。|
 

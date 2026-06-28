@@ -9,6 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Parse/inspect GPH format | `python3 gph_parser.py [file.gph]` |
 | Convert GPH → CGNS/HDF5 | `python3 gph2cgns.py input.gph -o output.cgns` |
 | Convert FPH → CGNS (with fields) | `python3 fph2cgns.py input.fph -o output.cgns` |
+| FPH: skip FluidRegion zone | `python3 fph2cgns.py input.fph -o out.cgns --skip-fluid-region` |
+| FPH: FlowSolution as float64 | `python3 fph2cgns.py input.fph -o out.cgns --flow-f64` |
 | Single-zone export | `python3 gph2cgns.py input.gph --single-zone -z ZoneName` |
 | GPH Viewer GUI | `python3 gphviewer.py [file.gph]` |
 | Headless viewer (CI/server) | `QT_QPA_PLATFORM=offscreen python3 gphviewer.py file.gph` |
@@ -30,7 +32,7 @@ This is a **flat Python CLI/GUI toolkit** for reverse-engineering and converting
 
 - **`gph_model.py`** — Shared library: data types (`GphNode`, `GphDocument`), binary section scanners, heuristics for vertex-coordinate dialect detection, LS_Links/LS_Parts/LS_Assemblies parsers, mesh-preview builder. **Single source of truth** for GPH parsing logic, including `parse_ls_parts()` / cvol_id resolution.
 - **`gph2cgns.py`** — Mesh-only converter: imports `parse_ls_nodes_xyz`, `_read_conn_continuations`, and `parse_ls_parts` from `gph_model`. Reads GPH via mmap for files >512 MiB. Writes HDF5 v0 superblock CGNS (libver earliest/v108) for ANSA compatibility.
-- **`fph2cgns.py`** — FPH converter (mesh + FlowSolution field data): same mesh parsing as `gph2cgns` via `parse_ls_nodes_xyz`.
+- **`fph2cgns.py`** — FPH converter (mesh + `LS_SPHFile` FlowSolution): same mesh parsing as `gph2cgns` via `parse_ls_nodes_xyz`. FlowSolution `DataArray_t` default **R4 (float32)**; `--flow-f64` for R8. `--skip-fluid-region` omits the entire `FluidRegion` Zone via `_filter_zone_plan()`. `--clip-flow 1` clears sentinel values > 1e20.
 - **`gph_parser.py`** — CLI inspector: imports all parsing functions from `gph_model`, prints structured section layout and format description.
 - **`gphviewer.py`** — PyQt GUI browser/editor: imports parsing functions from `gph_model`, builds tree view + hex dump + data table + 3D mesh preview via `MeshPreviewWidget`.
 
@@ -42,7 +44,7 @@ This is a **flat Python CLI/GUI toolkit** for reverse-engineering and converting
 
 ### GPH section discovery
 
-Section offsets vary per file. All tools locate sections dynamically by scanning the buffer for 32-byte ASCII labels preceded by `[I4=32]`. The list of known section names is duplicated in `gph_model._SECTION_BOUNDARY_NAMES`, `gph2cgns._section_end`, and `gph_parser._parse_gph_buffer`. All three must stay in sync.
+Section offsets vary per file. All tools locate sections dynamically by scanning the buffer for 32-byte ASCII labels preceded by `[I4=32]`. The list of known section names is duplicated in `gph_model._SECTION_BOUNDARY_NAMES`, `gph2cgns._section_end`, `fph2cgns._section_end`, and `gph_parser._parse_gph_buffer`. All four must stay in sync (include `LS_SPHFile` for FPH).
 
 ### Vertex coordinate dialect auto-detection
 

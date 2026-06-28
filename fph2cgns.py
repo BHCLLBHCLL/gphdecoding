@@ -14,6 +14,8 @@ convention employed by the vendor's own ``FLDUTIL`` exporter
 The FlowSolution_t node carries cell-centered result variables parsed from
 ``LS_SPHFile`` (EC_Scalar / EC_Vector records).  By default each
 ``DataArray_t`` is written as ``R4`` (float32); use ``--flow-f64`` for ``R8``.
+Use ``--skip-fluid-region`` to omit the whole ``FluidRegion`` Zone_t (other
+zones unchanged).  ``--clip-flow 1`` clears solver sentinel values (> 1e20).
 
 Requires: numpy, h5py (no CGNS library needed).
 """
@@ -97,7 +99,7 @@ def _section_end(data: bytes, sec_start: int) -> int:
         "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
         "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
         "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
-        "LS_Assemblies",
+        "LS_Assemblies", "LS_SPHFile",
         "Element_InformationFlag", "OverlapEnd",
     ]
     best = len(data)

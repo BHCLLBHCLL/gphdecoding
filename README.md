@@ -9,7 +9,7 @@ Reverse-engineer and convert **GPH** (Software Cradle scFLOW / SCTpre CFD mesh) 
 | **gph_model.py** | Shared parsing library (`parse_ls_parts`, `parse_ls_cvol_ids`, mesh topology, tree model) |
 | **gph_parser.py** | CLI inspector — section layout, format description, partition summary |
 | **gph2cgns.py** | GPH / FPH mesh → CGNS/HDF5 (multi-zone, polyhedral NGON_n / NFACE_n) |
-| **fph2cgns.py** | FPH → CGNS with FlowSolution field data (uses same mesh parsing as gph2cgns) |
+| **fph2cgns.py** | FPH → CGNS with FlowSolution (`--flow-f64`, `--skip-fluid-region`, `--clip-flow`) |
 | **gphviewer.py** | PyQt GUI browser/editor (tree + hex dump + 3D preview) |
 | **GPH_FORMAT_SPEC.md** | Reverse-engineered GPH binary format specification (Chinese) |
 | **DEV_SUMMARY.md** | Development log and design decisions |
@@ -29,7 +29,9 @@ Outputs section layout, data samples, and full format description.
 ```bash
 python gph2cgns.py tests/box_ansa.gph -o box.cgns
 python gph2cgns.py input.gph -o output.cgns -z ZoneName   # single-zone export
-python fph2cgns.py tests/tr03_9.fph -o tr03_9.cgns      # FPH + FlowSolution fields
+python fph2cgns.py tests/tr03_9.fph -o tr03_9.cgns      # FPH + FlowSolution (R4 default)
+python fph2cgns.py tests/tr03_9.fph -o out.cgns --skip-fluid-region   # omit FluidRegion zone
+python fph2cgns.py tests/tr03_9.fph -o out.cgns --flow-f64            # FlowSolution as float64
 ```
 Requires: `pip install numpy h5py`
 

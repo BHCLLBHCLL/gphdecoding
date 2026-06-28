@@ -89,7 +89,7 @@ def _section_end(data: bytes, sec_start: int) -> int:
         "Unused", "Encoding", "HeaderDataEnd", "OverlapStart_0",
         "LS_CvolIdOfElements", "LS_Links", "LS_Nodes", "LS_SurfaceRegions",
         "LS_SolverUnusedRegions", "LS_VolumeRegions", "LS_Parts",
-        "LS_Assemblies",
+        "LS_Assemblies", "LS_SPHFile",
         "Element_InformationFlag", "OverlapEnd",
     ]
     best = len(data)
