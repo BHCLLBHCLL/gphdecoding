@@ -12,8 +12,8 @@ convention employed by the vendor's own ``FLDUTIL`` exporter
 (see :file:`box_ansa_orig.cgns` for the reference layout).
 
 The FlowSolution_t node carries cell-centered result variables parsed from
-``LS_SPHFile`` (EC_Scalar / EC_Vector records), matching the layout of the
-vendor reference :file:`tr03_9.cgns`.
+``LS_SPHFile`` (EC_Scalar / EC_Vector records).  By default each
+``DataArray_t`` is written as ``R4`` (float32); use ``--flow-f64`` for ``R8``.
 
 Requires: numpy, h5py (no CGNS library needed).
 """
@@ -599,9 +599,9 @@ def _parse_ls_assemblies(data: bytes) -> dict:
 #   [descriptors + optional 4B block + 32B ASCII description]
 #   [1 data block (scalar) or 3 data blocks (vector X/Y/Z)]
 #
-# Each data block is ``n_cells × 4`` bytes of big-endian float32.  The
-# reference CGNS stores them as float64 (R8) DataArray_t nodes under
-# FlowSolution_t with GridLocation=CellCenter.
+# Each data block is ``n_cells × 4`` bytes of big-endian float32.  CGNS
+# output stores them as R4 (float32) DataArray_t nodes by default; pass
+# ``flow_f64=True`` to write R8 (float64) instead.
 #
 # Variable naming convention:
 #   EC_Scalar:NAME  ->  ``NAME``
@@ -1214,12 +1214,14 @@ def _write_zone_bc(zone, bc_families: list[tuple[str, np.ndarray]]) -> None:
 
 
 def _write_flow_solution(zone,
-                         flow_data: "Optional[dict[str, np.ndarray]]" = None) -> None:
+                         flow_data: "Optional[dict[str, np.ndarray]]" = None,
+                         *,
+                         flow_f64: bool = False) -> None:
     """Write the ``FlowSolution_t`` node with cell-centered result variables.
 
     When *flow_data* is non-empty, each ``(name, array)`` pair becomes a
-    ``DataArray_t`` child (type ``R8``, float64) matching the vendor's
-    :file:`tr03_9.cgns` layout.  An empty *flow_data* still emits the
+    ``DataArray_t`` child.  Default type is ``R4`` (float32); set *flow_f64*
+    for ``R8`` (float64).  An empty *flow_data* still emits the
     ``FlowSolution`` + ``GridLocation`` skeleton so the zone structure is
     uniform across files with and without solver results.
     """
@@ -1227,15 +1229,19 @@ def _write_flow_solution(zone,
     gl = _cgns_node(fs, "GridLocation", "GridLocation_t", "C1")
     _bytes_dataset(gl, " data", b"CellCenter")
     if flow_data:
+        cgns_type = "R8" if flow_f64 else "R4"
+        out_dtype = np.float64 if flow_f64 else np.float32
         for var_name, arr in flow_data.items():
-            vd = _cgns_node(fs, var_name, "DataArray_t", "R8")
+            vd = _cgns_node(fs, var_name, "DataArray_t", cgns_type)
             vd.create_dataset(" data",
-                              data=np.ascontiguousarray(arr, dtype=np.float64))
+                              data=np.ascontiguousarray(arr, dtype=out_dtype))
 
 
 def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict,
                  bc_families: Optional[list[tuple[str, np.ndarray]]] = None,
-                 flow_data: "Optional[dict[str, np.ndarray]]" = None) -> None:
+                 flow_data: "Optional[dict[str, np.ndarray]]" = None,
+                 *,
+                 flow_f64: bool = False) -> None:
     n_vertex = int(vertices.shape[0])
     n_faces = int(link_data["n_faces"])
     n_cells = int(link_data["n_cells"])
@@ -1265,7 +1271,7 @@ def _write_zone(base, zone_name: str, vertices: np.ndarray, link_data: dict,
         bc_families = [("box_surfs", boundary_1)]
     _write_zone_bc(zone, bc_families)
 
-    _write_flow_solution(zone, flow_data=flow_data)
+    _write_flow_solution(zone, flow_data=flow_data, flow_f64=flow_f64)
 
 
 def _bc_families_for_zone(
@@ -1295,6 +1301,17 @@ def _bc_families_for_zone(
             local = np.empty(0, dtype=np.int32)
         out.append((name, local))
     return out
+
+
+def _filter_zone_plan(
+    plan: list[tuple[str, np.ndarray]],
+    *,
+    skip_fluid_region: bool = False,
+) -> list[tuple[str, np.ndarray]]:
+    """Drop ``FluidRegion`` from the emit list when requested."""
+    if not skip_fluid_region:
+        return plan
+    return [(name, mask) for name, mask in plan if name != "FluidRegion"]
 
 
 def _build_zone_plan(mesh: dict,
@@ -1397,7 +1414,10 @@ def _build_zone_plan(mesh: dict,
 
 
 def write_cgns(mesh: dict, outpath: str,
-               zone_names: Optional[tuple] = None) -> None:
+               zone_names: Optional[tuple] = None,
+               *,
+               flow_f64: bool = False,
+               skip_fluid_region: bool = False) -> None:
     """Write *mesh* to a CGNS/HDF5 file using the FLDUTIL exporter's layout.
 
     The resulting file contains:
@@ -1421,7 +1441,14 @@ def write_cgns(mesh: dict, outpath: str,
     if link_data is None:
         raise ValueError("No face/cell connectivity data (LS_Links parse failed)")
 
-    zone_plan = _build_zone_plan(mesh, override_zone_names=zone_names)
+    zone_plan = _filter_zone_plan(
+        _build_zone_plan(mesh, override_zone_names=zone_names),
+        skip_fluid_region=skip_fluid_region,
+    )
+    if not zone_plan:
+        raise ValueError(
+            "No zones to write (--skip-fluid-region removed all planned zones)"
+        )
 
     # Use ``libver=("earliest", "v108")`` to write a **v0 superblock** file
     # with ``track_order=True`` to force new-style group format (Link Info
@@ -1467,30 +1494,30 @@ def write_cgns(mesh: dict, outpath: str,
         full_gph_to_local = np.arange(1, n_faces_full + 1, dtype=np.int64)
 
         for zname, cell_mask in zone_plan:
+            if not flow_solution:
+                zone_flow = None
+            elif cell_mask.all():
+                zone_flow = flow_solution
+            else:
+                zone_flow = {name: arr[cell_mask] for name, arr in flow_solution.items()}
+
             if cell_mask.all():
                 # Whole-mesh zone — no sub-mesh extraction needed.
                 bc_families = (_bc_families_for_zone(surface_regions,
                                                       full_gph_to_local)
                                if surface_regions else None)
-                # FlowSolution data is already in GPH cell order, matching
-                # the whole-mesh zone's cell numbering.
-                zone_flow = flow_solution if flow_solution else None
                 _write_zone(base, zname, vertices, link_data,
-                            bc_families=bc_families, flow_data=zone_flow)
+                            bc_families=bc_families, flow_data=zone_flow,
+                            flow_f64=flow_f64)
             else:
                 sub = _extract_zone_submesh(vertices, link_data, cell_mask)
                 gph_to_local = sub["link_data"]["gph_to_local_face_1based"]
                 bc_families = (_bc_families_for_zone(surface_regions,
                                                       gph_to_local)
                                if surface_regions else None)
-                # Slice the FlowSolution data by the zone's cell mask so the
-                # values align with the sub-mesh's local cell numbering
-                # (cells are renumbered in increasing GPH-cell-ID order, which
-                # is exactly what boolean-indexing with cell_mask yields).
-                zone_flow = ({name: arr[cell_mask] for name, arr in flow_solution.items()}
-                             if flow_solution else None)
                 _write_zone(base, zname, sub["vertices"], sub["link_data"],
-                            bc_families=bc_families, flow_data=zone_flow)
+                            bc_families=bc_families, flow_data=zone_flow,
+                            flow_f64=flow_f64)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1523,6 +1550,12 @@ def main():
                         help="When set to 1, reset FlowSolution values (PRES, etc.) "
                              "greater than 1e20 to 0 (clears solver sentinel/unused "
                              "values).  Default: 0 (no clipping).")
+    parser.add_argument("--flow-f64", action="store_true",
+                        help="Write FlowSolution DataArray_t as R8 (float64). "
+                             "Default: R4 (float32), matching FPH source data.")
+    parser.add_argument("--skip-fluid-region", action="store_true",
+                        help="Do not emit the FluidRegion Zone_t (mesh, BC, and "
+                             "FlowSolution). Other zones are unchanged.")
     args = parser.parse_args()
 
     gph_path = Path(args.gph_file) if args.gph_file else _default_sample_gph()
@@ -1573,14 +1606,19 @@ def main():
                 print(f"  Clip     : {var_name} — reset {n_clipped} values "
                       f"(> {clip_threshold:.0e}) to 0")
 
-    plan = _build_zone_plan(mesh, override_zone_names=zone_names)
+    plan = _filter_zone_plan(
+        _build_zone_plan(mesh, override_zone_names=zone_names),
+        skip_fluid_region=args.skip_fluid_region,
+    )
     print(f"  Zones    : {len(plan)}")
     for zname, mask in plan:
         cell_count = int(mask.sum())
         print(f"             - {zname}  ({cell_count} cells)")
 
     print(f"Writing: {out_path}")
-    write_cgns(mesh, str(out_path), zone_names=zone_names)
+    write_cgns(mesh, str(out_path), zone_names=zone_names,
+               flow_f64=args.flow_f64,
+               skip_fluid_region=args.skip_fluid_region)
     print("Done.")
 
 
